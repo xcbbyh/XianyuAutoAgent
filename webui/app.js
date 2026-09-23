@@ -142,6 +142,7 @@ const ICON_PATHS = {
   items: "M20 7H4v13h16V7zM16 7V4H8v3M4 12h16",
   listings: "M12 5v14M5 12h14M4 4h16v16H4z",
   screenshots: "M4 8h3l2-3h6l2 3h3v11H4zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",
+  assistant: "M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8zM18 15l.9 2.1L21 18l-2.1.9L18 21l-.9-2.1L15 18l2.1-.9z",
   safety: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3zm-3 9l2 2 4-4",
   chats: "M4 5h16v11H8l-4 4V5z",
   logs: "M5 4h14v16H5zM8 8h8M8 12h8M8 16h5",
@@ -156,7 +157,7 @@ const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColo
 
 const NAV = [
   ["总览", [["overview", "仪表盘"]]],
-  ["客服中心", [["reply", "AI 自动回复"], ["keywords", "关键词回复"], ["prompts", "话术提示词"], ["blacklist", "黑名单"]]],
+  ["客服中心", [["assistant", "AI 助手"], ["reply", "AI 自动回复"], ["keywords", "关键词回复"], ["prompts", "话术提示词"], ["blacklist", "黑名单"]]],
   ["商品与交易", [["items", "商品管理"], ["listings", "自动上架"], ["screenshots", "网页截图"], ["delivery", "自动发货"]]],
   ["数据中心", [["chats", "对话记录"], ["logs", "运行日志"]]],
   ["接入配置", [["models", "AI 模型"], ["account", "闲鱼账号"], ["notify", "消息通知"]]],
@@ -165,6 +166,7 @@ const NAV = [
 ];
 const PAGE_SUB = {
   overview: "运行状态与今日数据",
+  assistant: "跟 AI 说需求，它帮你上架、擦亮、改规则（改动前要你确认）",
   reply: "AI 开关、人工接管、营业时间",
   keywords: "命中关键词时直接回复固定话术，优先于 AI",
   prompts: "决定 AI 怎么说话、怎么议价",
@@ -1052,6 +1054,132 @@ function editListing(l, choices) {
     btn.disabled = false; btn.textContent = "生成";
   };
 }
+
+/* ---------------- AI 助手 ---------------- */
+
+const ASSISTANT_HELLO = "你好，我是你的闲鱼 AI 助手。直接告诉我要做什么，比如上架商品、擦亮商品、加关键词回复、设置自动发货。只要是会改动东西的操作，我都会先列出来，等你点「确认执行」后才会去做。";
+const ASSISTANT_TIPS = ["帮我上架一个商品", "把所有在售商品擦亮一遍", "买家问「包邮吗」就自动回复「包邮的亲」", "看看机器人现在的状态", "我有哪些自动发货规则？"];
+
+function assistantState() {
+  if (!state.assistant) state.assistant = { history: [], timeline: [], busy: false };
+  return state.assistant;
+}
+
+PAGES.assistant = async (el) => {
+  const s = assistantState();
+  el.innerHTML = `
+    <div class="card assistant">
+      <div class="card-head"><h3>🤖 AI 助手</h3><span class="desc">用聊天的方式操作控制台；会改动东西的操作都要你点确认</span>
+        <div class="actions"><button class="btn sm" id="asReset">清空对话</button></div></div>
+      <div class="ai-chat as-chat">
+        <div class="ai-msgs" id="asMsgs"></div>
+        <div class="as-tips" id="asTips"></div>
+        <form class="ai-input" id="asForm">
+          <textarea id="asText" rows="2" placeholder="告诉 AI 你要做什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button class="btn primary" type="submit" id="asSend">发送</button>
+        </form>
+      </div>
+      <div class="help">能做：上架商品（可用网页截图当图片）、擦亮、同步在售商品、关键词回复、自动发货规则、黑名单、回复设置、启停机器人。
+        暂时做不到：修改或下架闲鱼上已发布的商品、替你回复买家。用的是你在「AI 模型」里配置的模型。</div>
+    </div>`;
+
+  const actionHtml = (a, i) => {
+    const args = Object.entries(a.args || {}).filter(([k]) => k !== "screenshots")
+      .map(([k, v]) => `<div><span>${esc(k)}</span><span>${esc(typeof v === "object" ? JSON.stringify(v, null, 1) : v)}</span></div>`).join("");
+    const needImgs = a.tool === "create_listing" && a.status === "pending";
+    const imgs = a.images || [];
+    return `<div class="as-action ${a.status}">
+      <div class="as-action-head"><b>${a.status === "done" ? "✓ 已执行" : a.status === "cancelled" ? "已取消" : "待确认"}：${esc(a.summary)}</b></div>
+      <details ${a.tool === "create_listing" && a.status === "pending" ? "open" : ""}><summary>查看详细内容</summary><div class="as-args">${args}</div></details>
+      ${(a.args?.screenshots || []).length ? `<div class="muted" style="font-size:12px">使用截图：${esc(a.args.screenshots.join("、"))}</div>` : ""}
+      ${needImgs ? `<div class="ai-imgs" style="margin:8px 0 0">${imgs.map((img, j) => `<div class="ai-img"><img src="/uploads/${esc(img)}" alt="">
+          <button type="button" class="btn sm danger" data-asrmimg="${i}:${j}">删</button></div>`).join("")}
+        <label class="btn ai-add"><span>＋</span><small>上传图片</small><input type="file" accept="image/*" multiple hidden data-asupload="${i}"></label>
+        <button type="button" class="btn ai-add" data-asshots="${i}"><span>📷</span><small>从截图选</small></button></div>` : ""}
+      ${a.status === "pending" ? `<div class="ai-actions"><button class="btn primary sm" data-asok="${i}">确认执行</button><button class="btn sm" data-asno="${i}">取消</button></div>` : ""}
+      ${a.result ? `<div class="as-result ${a.error ? "bad" : "good"}">${esc(a.result)}</div>` : ""}
+    </div>`;
+  };
+
+  const render = () => {
+    const box = $("#asMsgs");
+    if (!box) return;
+    box.innerHTML = [`<div class="ai-msg ai">${esc(ASSISTANT_HELLO)}</div>`,
+      ...s.timeline.map((t, i) => t.kind === "action" ? actionHtml(t, i)
+        : `<div class="ai-msg ${t.kind === "user" ? "me" : "ai"} ${t.error ? "bad" : ""}">${esc(t.content).replace(/\n/g, "<br>")}</div>`),
+      s.busy ? `<div class="ai-msg ai muted">AI 正在处理…</div>` : ""].join("");
+    box.scrollTop = box.scrollHeight;
+    $("#asSend").disabled = s.busy;
+    $("#asTips").innerHTML = s.timeline.length ? "" : ASSISTANT_TIPS.map((t) => `<button type="button" class="chip" data-astip="${esc(t)}">${esc(t)}</button>`).join("");
+    $$("[data-astip]").forEach((b) => (b.onclick = () => { $("#asText").value = b.dataset.astip; $("#asText").focus(); }));
+    $$("[data-asok]").forEach((b) => (b.onclick = () => confirmAction(Number(b.dataset.asok), b)));
+    $$("[data-asno]").forEach((b) => (b.onclick = async () => {
+      const a = s.timeline[b.dataset.asno];
+      await api("/api/assistant/cancel", { id: a.id }).catch(() => {});
+      a.status = "cancelled";
+      s.history.push({ role: "user", content: `【系统】卖家取消了操作：${a.summary}`, hidden: true });
+      render();
+    }));
+    $$("[data-asrmimg]").forEach((b) => (b.onclick = () => {
+      const [i, j] = b.dataset.asrmimg.split(":").map(Number);
+      s.timeline[i].images.splice(j, 1); render();
+    }));
+    $$("[data-asupload]").forEach((inp) => inp.addEventListener("change", async (e) => {
+      const a = s.timeline[inp.dataset.asupload];
+      a.images = a.images || [];
+      for (const file of [...e.target.files].slice(0, 9 - a.images.length)) {
+        const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+        try { a.images.push(await api("/api/listings/upload", { name: file.name, data })); } catch (err) { toast(err.message, "error"); }
+      }
+      render();
+    }));
+    $$("[data-asshots]").forEach((b) => (b.onclick = () => {
+      const a = s.timeline[b.dataset.asshots];
+      a.images = a.images || [];
+      pickScreenshots((img) => { if (a.images.length < 9) a.images.push(img); render(); }).catch((err) => toast(err.message, "error"));
+    }));
+  };
+
+  const confirmAction = async (i, btn) => {
+    const a = s.timeline[i];
+    btn.disabled = true; btn.textContent = "执行中…";
+    try {
+      const r = await api("/api/assistant/confirm", { id: a.id, extra: { images: a.images || [] } });
+      a.status = "done"; a.result = r.result; a.error = false;
+      s.history.push({ role: "user", content: `【系统】卖家确认并已执行：${a.summary}。结果：${r.result}`, hidden: true });
+    } catch (err) {
+      a.result = "没有执行成功：" + err.message; a.error = true;
+    }
+    render();
+  };
+
+  const send = async () => {
+    const text = $("#asText").value.trim();
+    if (!text || s.busy) return;
+    $("#asText").value = "";
+    s.history.push({ role: "user", content: text });
+    s.timeline.push({ kind: "user", content: text });
+    s.busy = true; render();
+    try {
+      const r = await api("/api/assistant/chat", { messages: s.history.map(({ role, content }) => ({ role, content })) });
+      s.history.push(...r.messages);
+      r.messages.filter((m) => !m.hidden).forEach((m) => s.timeline.push({ kind: "ai", content: m.content }));
+      r.actions.forEach((a) => s.timeline.push({ kind: "action", status: "pending", images: [], ...a }));
+    } catch (err) {
+      s.history.pop();
+      s.timeline.push({ kind: "ai", content: "⚠ " + err.message, error: true });
+    }
+    s.busy = false;
+    if (state.page === "assistant") render();
+  };
+
+  $("#asForm").onsubmit = (e) => { e.preventDefault(); send(); };
+  $("#asText").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  });
+  $("#asReset").onclick = () => { state.assistant = null; navigate("assistant", true); };
+  render();
+};
 
 /* ---------------- 网页截图 ---------------- */
 
