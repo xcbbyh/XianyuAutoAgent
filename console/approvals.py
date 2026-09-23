@@ -18,9 +18,6 @@ KINDS = {"ai": "AI 回复", "keyword": "关键词回复", "away": "离线提示"
 # 发出去之后记到统计里的事件类型
 EVENT_OF_KIND = {"ai": "ai_reply", "fallback": "ai_reply", "keyword": "keyword_reply", "away": "away_reply",
                  "delivery": "delivery"}
-# 每种回复由哪个开关控制「发送前需要我同意」
-SETTING_OF_KIND = {"ai": "reply_approval", "fallback": "reply_approval", "away": "reply_approval",
-                   "keyword": "keyword_approval", "delivery": "delivery_approval"}
 STATUS = {"pending": "待审核", "approved": "已同意，等待发送", "sending": "发送中", "sent": "已发送",
           "rejected": "不发送", "failed": "发送失败"}
 
