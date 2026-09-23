@@ -52,3 +52,5 @@ htmlcov/
 .nox/
 .hypothesis/
 .coverage.* 
+# 控制台依赖安装标记
+.deps_installed
