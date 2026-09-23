@@ -9,31 +9,50 @@ import threading
 import time
 from types import SimpleNamespace
 
+import httpx
 from loguru import logger
 from openai import OpenAI
 
-from . import providers
+from . import netproxy, providers
 
 _clients = {}
 _clients_lock = threading.Lock()
 
 
-def _client(base_url, api_key):
-    cache_key = (base_url, api_key)
+def _http_client(proxy_url):
+    """只给 AI 调用用的 HTTP 客户端：有代理就明确走代理；直连时不读环境变量里的代理"""
+    if not proxy_url:
+        return httpx.Client(trust_env=False, timeout=40)
+    try:
+        return httpx.Client(proxy=proxy_url, trust_env=False, timeout=40)
+    except TypeError:  # 旧版 httpx 参数名是 proxies
+        return httpx.Client(proxies=proxy_url, trust_env=False, timeout=40)
+
+
+def _client(base_url, api_key, proxy_url=""):
+    cache_key = (base_url, api_key, proxy_url)
     with _clients_lock:
         if cache_key not in _clients:
-            _clients[cache_key] = OpenAI(api_key=api_key or "none", base_url=base_url, timeout=40, max_retries=0)
+            _clients[cache_key] = OpenAI(api_key=api_key or "none", base_url=base_url, timeout=40, max_retries=0,
+                                         http_client=_http_client(proxy_url))
         return _clients[cache_key]
 
 
-def call_provider(provider, api_key, **kwargs):
-    """调用单个平台；遇到平台不支持的参数时去掉该参数重试"""
-    params = dict(kwargs)
-    params["model"] = provider["model"]
-    extra = params.pop("extra_body", None)
-    if extra and provider.get("supports_search"):
-        params["extra_body"] = extra
-    client = _client(provider["base_url"], api_key)
+def _is_network_error(e):
+    name = type(e).__name__
+    return getattr(e, "status_code", None) is None and ("Timeout" in name or "Connection" in name)
+
+
+class AIConnectionError(Exception):
+    """所有线路（代理、直连）都连不上；attempts 是每条线路的 (线路, 异常)"""
+
+    def __init__(self, attempts):
+        self.attempts = attempts
+        super().__init__("；".join(f"{netproxy.route_label(url)}：{type(e).__name__}: {e}" for url, e in attempts))
+
+
+def _call_once(client, params):
+    """遇到平台不支持的参数时去掉该参数重试"""
     for _ in range(3):
         try:
             return client.chat.completions.create(**params)
@@ -48,6 +67,33 @@ def call_provider(provider, api_key, **kwargs):
             else:
                 raise
     return client.chat.completions.create(**params)
+
+
+def call_provider(provider, api_key, **kwargs):
+    """
+    调用单个平台。网络线路：有本机代理先走代理，连不上再直连（只针对 AI 调用，闲鱼和浏览器不受影响）。
+    """
+    params = dict(kwargs)
+    params["model"] = provider["model"]
+    extra = params.pop("extra_body", None)
+    if extra and provider.get("supports_search"):
+        params["extra_body"] = extra
+    attempts = []
+    for proxy_url in netproxy.routes(provider["base_url"]):
+        try:
+            resp = _call_once(_client(provider["base_url"], api_key, proxy_url), dict(params))
+            netproxy.last_route[provider.get("id") or provider["name"]] = netproxy.route_label(proxy_url)
+            if attempts:
+                logger.info(f"{provider['name']} 走代理连不上，已改为{netproxy.route_label(proxy_url)}调用成功")
+            return resp
+        except Exception as e:
+            if not _is_network_error(e):
+                raise
+            logger.warning(f"{provider['name']} {netproxy.route_label(proxy_url)}连不上：{type(e).__name__}: {e}")
+            attempts.append((proxy_url, e))
+    if len(attempts) == 1:
+        raise attempts[0][1]
+    raise AIConnectionError(attempts)
 
 
 # 限流（429）和平台临时出错（5xx）时同一个 Key 等一会再试，最多再试 2 次
@@ -70,6 +116,8 @@ def _retry_wait(e, attempt):
         except Exception:
             pass
         return wait
+    if isinstance(e, AIConnectionError):
+        return None  # 代理和直连都已经试过了
     if ("Timeout" in name or "Connection" in name) and attempt == 0:
         return 1
     return None

@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import dotenv_values, set_key
 
-from . import approvals, assistant, auth, browser, notify, providers, rules, safety, shop, store
+from . import approvals, assistant, auth, netproxy, browser, notify, providers, rules, safety, shop, store
 
 BASE_DIR = store.BASE_DIR
 ENV_PATH = store.ENV_PATH
@@ -486,6 +486,7 @@ GET_ROUTES = {
     "/api/overview": lambda q, u: _overview(),
     "/api/settings": lambda q, u: store.get_settings(),
     "/api/providers": lambda q, u: {"providers": providers.list_providers(), "categories": providers.CATEGORIES,
+                                    "proxy": netproxy.status(), "ai_proxy": store.get_settings().get("ai_proxy", ""),
                                     "ai_replies_today": store.dashboard_stats(1)["today"].get("ai_reply", 0)},
     "/api/keywords": lambda q, u: {"rules": rules.list_keywords(), "match_types": rules.MATCH_TYPES},
     "/api/delivery": lambda q, u: {"rules": rules.list_delivery_rules(), "records": rules.list_deliveries(),

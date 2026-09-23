@@ -181,6 +181,8 @@ DEFAULT_SETTINGS = {
     # 自动擦亮：每天在时间窗口内随机挑一个时间执行
     "auto_polish": {"enabled": False, "window_start": "08:00", "window_end": "10:00"},
     "polish_last_date": "",
+    # AI 模型调用走的代理：留空自动检测（Windows 系统代理 / Clash 7890 端口），direct 表示直连；闲鱼和浏览器始终直连
+    "ai_proxy": "",
     # 网页截图：登录网址和要截图的页面列表（在「网页截图」页面单独保存）
     "screenshot_login_url": "",
     "screenshot_pages": [],

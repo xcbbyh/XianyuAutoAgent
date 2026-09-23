@@ -277,9 +277,9 @@ def _platform_message(e):
 
 NETWORK_CAUSES = [
     (("getaddrinfo", "name or service not known", "11001", "nodename nor servname"), "域名解析失败（DNS），代理软件没有接管这个域名"),
-    (("10061", "refused"), "连接被拒绝，代理软件的端口可能没开"),
+    (("10061", "refused"), "连接被拒绝"),
     (("10054", "reset by peer", "forcibly closed", "unexpected_eof", "eof occurred", "remoteprotocolerror",
-      "server disconnected"), "连接被中途切断，多半是代理节点不可用，或者这个请求被直连出去后被拦截"),
+      "server disconnected"), "连接被中途切断"),
     (("certificate_verify_failed", "certificate verify failed"), "证书校验失败，代理软件可能在拦截 HTTPS"),
     (("10060", "timed out"), "连接超时"),
 ]
@@ -296,6 +296,14 @@ def _root_cause(e):
     return f"{type(last).__name__}: {last}"[:200] if last else ""
 
 
+def _net_reason(e):
+    """(底层异常文字, 中文原因)"""
+    cause = _root_cause(e)
+    low = cause.lower()
+    reason = next((text for keys, text in NETWORK_CAUSES if any(k in low for k in keys)), "") if cause else ""
+    return cause, reason
+
+
 def _describe_error(e, provider):
     """把调用异常整理成「状态码 + 中文原因 + 原始信息」；网络问题和 Key 问题分开说"""
     code = getattr(e, "status_code", None)
@@ -305,26 +313,40 @@ def _describe_error(e, provider):
         hint = ERROR_HINTS.get(code) or ("平台服务器出错，稍后再试" if code >= 500 else "调用失败")
         if code >= 500:
             kind = "server"
+    elif hasattr(e, "attempts"):  # llm.AIConnectionError：代理和直连都试过了
+        from . import netproxy
+        kind = "network"
+        parts = []
+        for proxy_url, err in e.attempts:
+            reason = _net_reason(err)[1] or ("超时没有响应" if "Timeout" in type(err).__name__ else "连不上")
+            parts.append(f"{netproxy.route_label(proxy_url)}：{reason}")
+        proxy_url, proxy_err = next(((u, err) for u, err in e.attempts if u), ("", None))
+        if proxy_err is not None and _net_reason(proxy_err)[1] == "连接被拒绝":
+            advice = f"代理 {proxy_url} 的端口没有程序在听，请确认 Clash 已经打开，或者在上面改成正确的代理端口"
+        else:
+            advice = "代理软件当前选的节点多半不可用，请在 Clash 里换一个能用的节点（或点一下测速）再试"
+        hint = f"网络问题：{'；'.join(parts)}。{advice}"
     elif "Timeout" in name or "Connection" in name:
         kind = "network"
         what = "超时没有响应" if "Timeout" in name else "连不上接口地址"
+        from . import netproxy
+        if provider.get("category") != "local" and not netproxy.current()["url"]:
+            what += f"（AI 调用是直连的：{netproxy.current()['source']}）"
         if provider.get("category") == "local":
             hint = f"网络问题：{what}，请确认本地模型程序已经启动"
         elif provider.get("category") == "overseas" or provider.get("id") == "openrouter":
-            hint = f"网络问题：{what}。海外模型需要代理，请确认代理软件（如 Clash）让 python.exe 走代理，而不是直连"
+            hint = f"网络问题：{what}。海外模型需要代理：请打开 Clash（或在上面填代理地址，例如 127.0.0.1:7890）"
         else:
             hint = f"网络问题：{what}，请检查网络或接口地址"
     else:
         hint = "调用失败"
     error = str(e)[:300]
-    if kind == "network":
-        cause = _root_cause(e)
+    if kind == "network" and not hasattr(e, "attempts"):
+        cause, reason = _net_reason(e)
         if cause:
             error = f"{error} 底层原因：{cause}"
-            low = cause.lower()
-            reason = next((text for keys, text in NETWORK_CAUSES if any(k in low for k in keys)), "")
-            if reason:
-                hint = f"{hint}（具体：{reason}）"
+        if reason:
+            hint = f"{hint}（具体：{reason}）"
     return {"code": code, "kind": kind, "hint": hint, "error": error, "detail": _platform_message(e)}
 
 
@@ -348,7 +370,9 @@ def _test_key(provider, index, key):
             messages=[{"role": "user", "content": "你好，请用一句话介绍你自己"}],
             max_tokens=60, temperature=0.3, timeout=25,
         )
-        item.update(ok=True, reply=(resp.choices[0].message.content or "").strip()[:120])
+        from . import netproxy
+        item.update(ok=True, reply=(resp.choices[0].message.content or "").strip()[:120],
+                    route=netproxy.last_route.get(provider.get("id") or provider["name"], ""))
     except Exception as e:
         item.update(ok=False, **_describe_error(e, provider))
     item["ms"] = int((time.time() - start) * 1000)
