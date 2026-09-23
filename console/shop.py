@@ -455,29 +455,104 @@ def run_publish(listing_id):
 
 # ---------------- AI 写文案 ----------------
 
-def ai_write(brief):
-    brief = str(brief or "").strip()
-    if not brief:
-        raise ValueError("先简单描述一下你要卖的东西，比如：九成新 iPad Air 5 64G 蓝色，带原装充电器")
+def _llm():
+    """控制台里配置的模型；都没配置时退回旧版 .env 里的 API_KEY"""
     from .llm import RoutedClient
+    from .server import env_values
 
     fallback = None
-    from .server import env_values
     key = (env_values().get("API_KEY") or "").strip()
     if key and "百炼" not in key:
         from openai import OpenAI
         fallback = OpenAI(api_key=key, base_url=env_values().get("MODEL_BASE_URL") or None)
-    try:
-        resp = _ai_complete(RoutedClient(fallback), brief)
-    except RuntimeError as e:
-        raise ValueError(str(e))
+    return RoutedClient(fallback)
+
+
+def _parse_json(resp):
     text = (resp.choices[0].message.content or "").strip()
     match = re.search(r"\{.*\}", text, re.S)
     try:
         data = json.loads(match.group(0) if match else text)
     except ValueError:
         raise ValueError("AI 返回的格式不对，请再试一次")
+    if not isinstance(data, dict):
+        raise ValueError("AI 返回的格式不对，请再试一次")
+    return data
+
+
+def ai_write(brief):
+    brief = str(brief or "").strip()
+    if not brief:
+        raise ValueError("先简单描述一下你要卖的东西，比如：九成新 iPad Air 5 64G 蓝色，带原装充电器")
+    try:
+        data = _parse_json(_ai_complete(_llm(), brief))
+    except RuntimeError as e:
+        raise ValueError(str(e))
     return {k: str(data.get(k, "")).strip() for k in ("title", "description", "category_hint")}
+
+
+CHAT_FIELDS = ("title", "description", "price", "orig_price", "category_hint", "delivery", "post_price")
+CHAT_SYSTEM = (
+    "你是闲鱼上架助手，帮卖家通过聊天把一件商品整理成可以直接发布的闲鱼商品。\n"
+    "规则：\n"
+    "1. 根据卖家说的话填写或修改商品草稿；卖家要求改哪里就只改哪里，其余保持不变。\n"
+    "2. 标题 15-30 个字，突出品牌型号、成色和卖点；描述 80-200 字，口语化，分几行写成色、配件、购买渠道/时间、出售原因、交易说明。\n"
+    "3. 不要编造卖家没提到的参数、成色和瑕疵；不要出现微信、QQ、手机号等站外联系方式。\n"
+    "4. 售价只能用卖家说过或明确同意的价格；卖家没给价格时 price 填 null，并在 reply 里问他想卖多少（可以给一个参考区间）。\n"
+    "5. delivery 只能是 包邮、按距离计费、一口价、无需邮寄 之一，默认 包邮；虚拟商品/卡密/服务类用 无需邮寄；"
+    "选 一口价 时 post_price 填邮费。\n"
+    "6. reply 是对卖家说的话，简短友好，说明你改了什么；信息不全就提问。卖家还没上传图片时提醒他上传或从截图里选图。\n"
+    '只输出 JSON：{"reply": "...", "draft": {"title": "...", "description": "...", "price": 数字或null, '
+    '"orig_price": 数字或null, "category_hint": "...", "delivery": "包邮", "post_price": 数字或null}}'
+)
+
+
+def _clean_draft(raw, base):
+    draft = dict(base)
+    for key in CHAT_FIELDS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if key in ("price", "orig_price", "post_price"):
+            try:
+                value = round(float(value), 2) if value not in (None, "") else None
+            except (TypeError, ValueError):
+                value = draft.get(key)
+            if value is not None and value < 0:
+                value = None
+        else:
+            value = str(value or "").strip()
+        draft[key] = value
+    if draft.get("delivery") not in DELIVERY_CHOICES:
+        draft["delivery"] = "包邮"
+    draft["title"] = str(draft.get("title") or "")[:60]
+    return draft
+
+
+def ai_chat(messages, draft=None, has_images=False):
+    """AI 上架助手：根据对话更新商品草稿，返回 AI 的回复和新草稿（不会直接发布）"""
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("请先说说你想卖什么")
+    history = []
+    for m in messages[-20:]:
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and str(m.get("content", "")).strip():
+            history.append({"role": m["role"], "content": str(m["content"])[:2000]})
+    if not history or history[-1]["role"] != "user":
+        raise ValueError("请先说说你想卖什么")
+    base = _clean_draft(draft if isinstance(draft, dict) else {}, {k: None for k in CHAT_FIELDS})
+    context = (f"当前商品草稿：{json.dumps(base, ensure_ascii=False)}\n"
+               f"卖家{'已经' if has_images else '还没有'}添加商品图片。")
+    try:
+        resp = _llm().chat.completions.create(
+            model="", temperature=0.5, max_tokens=1200,
+            messages=[{"role": "system", "content": CHAT_SYSTEM + "\n\n" + context}, *history],
+        )
+    except RuntimeError as e:
+        raise ValueError(str(e))
+    data = _parse_json(resp)
+    new_draft = _clean_draft(data.get("draft") if isinstance(data.get("draft"), dict) else {}, base)
+    reply = str(data.get("reply") or "").strip() or "草稿已更新，请看右边。"
+    return {"reply": reply, "draft": new_draft}
 
 
 def _ai_complete(llm, brief):

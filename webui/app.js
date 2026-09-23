@@ -804,6 +804,114 @@ function pollTask() {
 
 /* ---------------- 自动上架 ---------------- */
 
+/* AI 上架助手：像聊天一样说要卖什么，AI 整理成商品草稿，确认后加入上架队列 */
+
+const AI_SHOP_HELLO = "你好！告诉我你想卖什么，比如「九成新 iPad Air 5 64G 蓝色，带充电器，想卖 2000」。我会帮你写好标题和描述，你确认后再上架。";
+
+function aiShopState() {
+  if (!state.aiShop) state.aiShop = { messages: [], draft: { delivery: "包邮" }, images: [], busy: false };
+  return state.aiShop;
+}
+
+function aiShopHtml() {
+  return `
+    <div class="card ai-shop">
+      <div class="card-head"><h3>✨ AI 上架助手</h3><span class="desc">像聊天一样说你要卖什么，AI 写好标题、描述和价格；你点「确认上架」后才会发布</span>
+        <div class="actions"><button class="btn sm" id="aiReset">重新开始</button></div></div>
+      <div class="ai-shop-body">
+        <div class="ai-chat">
+          <div class="ai-msgs" id="aiMsgs"></div>
+          <form class="ai-input" id="aiForm">
+            <textarea id="aiText" rows="2" placeholder="说说你要卖什么，或者让 AI 修改，比如「价格改成 1800」「标题加上国行」…（Enter 发送，Shift+Enter 换行）"></textarea>
+            <button class="btn primary" type="submit" id="aiSend">发送</button>
+          </form>
+        </div>
+        <div class="ai-draft" id="aiDraft"></div>
+      </div>
+    </div>`;
+}
+
+function bindAiShop(el, choices) {
+  const s = aiShopState();
+  const renderMsgs = () => {
+    const box = $("#aiMsgs", el);
+    box.innerHTML = [{ role: "assistant", content: AI_SHOP_HELLO }, ...s.messages].map((m) =>
+      `<div class="ai-msg ${m.role === "user" ? "me" : "ai"}">${esc(m.content).replace(/\n/g, "<br>")}</div>`).join("")
+      + (s.busy ? `<div class="ai-msg ai muted">AI 正在写…</div>` : "");
+    box.scrollTop = box.scrollHeight;
+    $("#aiSend", el).disabled = s.busy;
+  };
+  const renderDraft = () => {
+    const d = s.draft;
+    const missing = [!s.images.length && "图片", !d.title && "标题", !d.description && "描述", (d.price == null || d.price === "") && "售价"].filter(Boolean);
+    $("#aiDraft", el).innerHTML = `
+      <div class="section-title" style="margin-top:0">商品图片（第一张是封面）</div>
+      <div class="ai-imgs">${s.images.map((img, i) => `<div class="ai-img"><img src="/uploads/${esc(img)}" alt="">
+          <button type="button" class="btn sm danger" data-airm="${i}">删</button></div>`).join("")}
+        ${s.images.length < 9 ? `<label class="btn ai-add"><span>＋</span><small>上传</small><input type="file" accept="image/*" multiple hidden id="aiImgInput"></label>
+        <button type="button" class="btn ai-add" id="aiFromShots"><span>📷</span><small>从截图选</small></button>` : ""}</div>
+      <div class="ai-fields">
+        <div><span>标题</span><b>${esc(d.title) || `<i class="muted">等 AI 生成</i>`}</b></div>
+        <div><span>售价</span><b>${d.price != null && d.price !== "" ? `¥ ${esc(d.price)}` : `<i class="muted">未定</i>`}</b>
+          ${d.orig_price ? `<span class="muted">原价 ¥ ${esc(d.orig_price)}</span>` : ""}</div>
+        <div><span>运费</span><b>${esc(d.delivery || "包邮")}${d.delivery === "一口价" && d.post_price != null ? ` ¥ ${esc(d.post_price)}` : ""}</b>
+          ${d.category_hint ? `<span class="muted">类目：${esc(d.category_hint)}</span>` : ""}</div>
+        <div><span>描述</span><p>${d.description ? esc(d.description).replace(/\n/g, "<br>") : `<i class="muted">等 AI 生成</i>`}</p></div>
+      </div>
+      ${missing.length ? `<div class="help">还缺：${missing.join("、")}</div>` : `<div class="help">都齐了。确认上架后会按防风控节奏自动发布到你的闲鱼。</div>`}
+      <div class="ai-actions">
+        <button class="btn primary" id="aiPublish" ${missing.length ? "disabled" : ""}>确认上架</button>
+        <button class="btn" id="aiDraftSave" ${missing.length ? "disabled" : ""}>存为草稿</button>
+        <button class="btn" id="aiEdit">手动修改</button>
+      </div>`;
+    $$("[data-airm]", el).forEach((b) => (b.onclick = () => { s.images.splice(Number(b.dataset.airm), 1); renderDraft(); }));
+    $("#aiImgInput", el)?.addEventListener("change", async (e) => {
+      for (const file of [...e.target.files].slice(0, 9 - s.images.length)) {
+        const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+        try { s.images.push(await api("/api/listings/upload", { name: file.name, data })); renderDraft(); }
+        catch (err) { toast(err.message, "error"); }
+      }
+    });
+    $("#aiFromShots", el)?.addEventListener("click", () => pickScreenshots((img) => {
+      if (s.images.length < 9) s.images.push(img);
+      renderDraft();
+    }).catch((err) => toast(err.message, "error")));
+    const save = async (action) => {
+      const r = await api("/api/listings/save", { ...d, images: s.images, action });
+      state.aiShop = null;
+      toast(action === "draft" ? "已存为草稿" : r.block ? `已加入上架队列（${r.block}，会自动顺延）` : "已加入上架队列，稍后自动发布");
+      navigate("listings", true);
+    };
+    $("#aiPublish", el).onclick = () => confirmBox(
+      `确认把「${d.title}」以 ¥${d.price} 上架到闲鱼？会加入上架队列，按防风控节奏自动发布。`,
+      () => save("publish").catch((err) => toast(err.message, "error")), "确认上架");
+    $("#aiDraftSave", el).onclick = () => save("draft").catch((err) => toast(err.message, "error"));
+    $("#aiEdit", el).onclick = () => editListing({ ...d, images: [...s.images] }, choices);
+  };
+  const send = async () => {
+    const text = $("#aiText", el).value.trim();
+    if (!text || s.busy) return;
+    s.messages.push({ role: "user", content: text });
+    $("#aiText", el).value = "";
+    s.busy = true; renderMsgs();
+    try {
+      const r = await api("/api/listings/ai_chat", { messages: s.messages, draft: s.draft, has_images: s.images.length > 0 });
+      s.messages.push({ role: "assistant", content: r.reply });
+      s.draft = r.draft;
+    } catch (err) {
+      s.messages.push({ role: "assistant", content: "⚠ " + err.message });
+    }
+    s.busy = false;
+    if (state.page === "listings") { renderMsgs(); renderDraft(); }
+  };
+  $("#aiForm", el).onsubmit = (e) => { e.preventDefault(); send(); };
+  $("#aiText", el).addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  });
+  $("#aiReset", el).onclick = () => { state.aiShop = null; navigate("listings", true); };
+  renderMsgs(); renderDraft();
+}
+
 const LISTING_BADGE = { draft: "", queued: "info", publishing: "warn", published: "good", failed: "bad" };
 
 PAGES.listings = async (el) => {
@@ -815,6 +923,7 @@ PAGES.listings = async (el) => {
       <span class="muted">排队中的商品由控制台按防风控规则逐个发布：今天已上架 ${sp.today.publish}/${sp.params.publish_daily_limit} 个，两次间隔至少 ${sp.params.publish_interval_minutes} 分钟，夜间 ${sp.params.quiet_start}-${sp.params.quiet_end} 不发布。
       ${sp.publish_block ? `当前暂不能发布：<b style="display:inline">${esc(sp.publish_block)}</b>。` : "当前可以发布。"}
       闲鱼账号需要先在 App 里设置过发货地址。建议先用一个商品试一次。</span></div></div>
+    ${aiShopHtml()}
     <div class="card">
       <div class="card-head"><h3>上架队列</h3><span class="desc">控制台要保持运行，排队的商品才会被发布</span>
         <div class="actions"><button class="btn primary" id="newListing">＋ 新建商品</button></div></div>
@@ -833,6 +942,7 @@ PAGES.listings = async (el) => {
             ${l.status !== "publishing" ? `<button class="btn sm danger" data-del="${l.id}">删除</button>` : ""}</td></tr>`).join("")}
         </tbody></table></div>` : emptyHtml("还没有商品。点「新建商品」，可以让 AI 根据一句话帮你写标题和描述。")}
     </div>`;
+  bindAiShop(el, d.delivery_choices);
   $("#newListing").onclick = () => editListing({}, d.delivery_choices);
   const find = (id) => d.listings.find((l) => l.id == id);
   $$("[data-edit]", el).forEach((b) => (b.onclick = () => editListing(find(b.dataset.edit), d.delivery_choices)));
@@ -1178,9 +1288,18 @@ PAGES.models = async (el) => {
   const { providers, categories } = await api("/api/providers");
   let filter = state.modelFilter || "all";
   const order = providers.filter((p) => p.enabled && p.key_count);
+  // 已启用但最近一次测试失败的模型，在页面顶部明确提示
+  const failing = order.filter((p) => p.last_test && (p.last_test.keys ? p.last_test.ok_count < p.last_test.total : !p.last_test.ok));
+  const failHtml = failing.length ? `<div class="banner bad"><div class="grow"><b>有模型测试没通过，机器人调用时可能失败</b>
+    ${failing.map((p) => {
+      const t = p.last_test;
+      const bad = t.keys ? t.keys.filter((k) => !k.ok) : [];
+      const why = bad.length ? [...new Set(bad.map((k) => `${k.code ? k.code + " " : ""}${k.hint}`))].join("；") : t.error;
+      return `<span style="display:block">${esc(p.name)}：${t.keys ? `${t.total - t.ok_count}/${t.total} 把 Key 不可用，` : ""}${esc(why)}</span>`;
+    }).join("")}</div></div>` : "";
   const render = () => {
     const list = providers.filter((p) => filter === "all" || (filter === "enabled" ? p.enabled : p.category === filter));
-    el.innerHTML = `
+    el.innerHTML = `${failHtml}
       <div class="banner ${order.length ? "info" : "warn"}"><div class="grow">
         ${order.length ? `<b>当前调用顺序（失败自动切换到下一个）</b><span>${order.map((p, i) => `${i + 1}. ${esc(p.name)}${p.key_count > 1 ? `（${p.key_count} 个 Key 轮换）` : ""}`).join(" → ")}</span>`
           : `<b>还没有可用的 AI 模型</b><span class="muted">选一个平台点「配置」，填入 API Key 并启用。推荐国内用户用通义千问或 DeepSeek。</span>`}

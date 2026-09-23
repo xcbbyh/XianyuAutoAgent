@@ -28,6 +28,9 @@ SHOT_DIR = os.path.join(store.DATA_DIR, "screenshots")
 XIANYU_URL = "https://www.goofish.com/"
 # 依次尝试：Edge（Windows 自带）→ Chrome → Playwright 自带的 Chromium
 CHANNELS = ("msedge", "chrome", None)
+# 登录闲鱼和自己的平台要走国内直连：浏览器不使用系统代理
+# （AI 模型的请求由 python.exe 发出，不受影响，照常走代理）
+BROWSER_ARGS = ["--disable-blink-features=AutomationControlled", "--start-maximized", "--no-proxy-server"]
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 FILE_RE = re.compile(r"[^/\\]+\.png")
 
@@ -73,7 +76,7 @@ class _Browser:
             try:
                 ctx = self.pw.chromium.launch_persistent_context(
                     PROFILE_DIR, channel=channel, headless=False, no_viewport=True,
-                    args=["--disable-blink-features=AutomationControlled", "--start-maximized"],
+                    args=BROWSER_ARGS,
                     ignore_default_args=["--enable-automation"],
                 )
             except Exception as e:

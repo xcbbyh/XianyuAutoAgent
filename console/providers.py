@@ -262,19 +262,27 @@ ERROR_HINTS = {
 }
 
 
-def _describe_error(e):
-    """把调用异常整理成「状态码 + 中文原因 + 原始信息」"""
+def _describe_error(e, provider):
+    """把调用异常整理成「状态码 + 中文原因 + 原始信息」；网络问题和 Key 问题分开说"""
     code = getattr(e, "status_code", None)
     name = type(e).__name__
+    kind = "key"
     if code:
         hint = ERROR_HINTS.get(code) or ("平台服务器出错，稍后再试" if code >= 500 else "调用失败")
-    elif "Timeout" in name:
-        hint = "超时没有响应（网络不通，或需要海外网络）"
-    elif "Connection" in name:
-        hint = "连不上接口地址（网络不通，或需要海外网络）"
+        if code >= 500:
+            kind = "server"
+    elif "Timeout" in name or "Connection" in name:
+        kind = "network"
+        what = "超时没有响应" if "Timeout" in name else "连不上接口地址"
+        if provider.get("category") == "local":
+            hint = f"网络问题：{what}，请确认本地模型程序已经启动"
+        elif provider.get("category") == "overseas" or provider.get("id") == "openrouter":
+            hint = f"网络问题：{what}。海外模型需要代理，请确认代理软件（如 Clash）让 python.exe 走代理，而不是直连"
+        else:
+            hint = f"网络问题：{what}，请检查网络或接口地址"
     else:
         hint = "调用失败"
-    return {"code": code, "hint": hint, "error": str(e)[:300]}
+    return {"code": code, "kind": kind, "hint": hint, "error": str(e)[:300]}
 
 
 def _test_key(provider, index, key):
@@ -290,7 +298,7 @@ def _test_key(provider, index, key):
         )
         item.update(ok=True, reply=(resp.choices[0].message.content or "").strip()[:120])
     except Exception as e:
-        item.update(ok=False, **_describe_error(e))
+        item.update(ok=False, **_describe_error(e, provider))
     item["ms"] = int((time.time() - start) * 1000)
     return item
 

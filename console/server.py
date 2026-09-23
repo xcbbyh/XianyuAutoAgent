@@ -551,6 +551,7 @@ POST_ROUTES = {
     "/api/listings/save": lambda p, u: shop.save_listing(p),
     "/api/listings/delete": lambda p, u: shop.delete_listing(p.get("id")),
     "/api/listings/ai_write": lambda p, u: shop.ai_write(p.get("brief", "")),
+    "/api/listings/ai_chat": lambda p, u: shop.ai_chat(p.get("messages"), p.get("draft"), bool(p.get("has_images"))),
     "/api/users/password": lambda p, u: auth.change_password(u["id"], p.get("old_password"),
                                                              p.get("new_password"), u.get("token")),
 }
