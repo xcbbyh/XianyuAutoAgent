@@ -1518,7 +1518,7 @@ PAGES.logs = async (el) => {
 /* ---------------- AI 模型 ---------------- */
 
 PAGES.models = async (el) => {
-  const { providers, categories, ai_replies_today: aiToday } = await api("/api/providers");
+  const { providers, categories, ai_replies_today: aiToday, proxy, ai_proxy: aiProxy } = await api("/api/providers");
   let filter = state.modelFilter || "all";
   const order = providers.filter((p) => p.enabled && p.key_count);
   // 已启用但最近一次测试失败的模型，在页面顶部明确提示
@@ -1537,6 +1537,11 @@ PAGES.models = async (el) => {
         ${order.length ? `<b>当前调用顺序（失败自动切换到下一个）</b><span>${order.map((p, i) => `${i + 1}. ${esc(p.name)}${p.key_count > 1 ? `（${p.key_count} 个 Key 轮换）` : ""}`).join(" → ")}</span>`
           : `<b>还没有可用的 AI 模型</b><span class="muted">选一个平台点「配置」，填入 API Key 并启用。推荐国内用户用通义千问或 DeepSeek。</span>`}
       </div></div>
+      <div class="banner info"><div class="grow"><b>🌐 AI 调用线路：${esc(proxy.label)}</b>
+        <span class="muted">（${esc(proxy.source)}${Object.keys(proxy.last).length ? "；最近成功：" + Object.entries(proxy.last).map(([k, v]) => `${esc(k)} 走${esc(v)}`).join("，") : ""}）
+        有代理时 AI 先走代理，连不上再自动直连。只有 AI 模型走这条线路，闲鱼接口、闲鱼消息和浏览器登录始终直连。</span></div>
+        <input type="text" id="aiProxy" value="${esc(aiProxy)}" placeholder="留空自动检测，例如 127.0.0.1:7890 或 direct" style="width:260px">
+        <button class="btn" id="saveProxy">保存</button></div>
       <div class="banner good-note"><div class="grow"><b>💰 空闲时不调用 AI，不消耗额度</b>
         <span class="muted">只有买家发来文字消息（且没命中关键词回复、不在黑名单、在营业时间内）、你用 AI 上架/AI 助手、或点「测试」时才会调用模型。
         心跳、同步、擦亮、自动发货都不调用 AI。今天 AI 已回复买家 ${aiToday || 0} 次。</span></div></div>
@@ -1548,6 +1553,10 @@ PAGES.models = async (el) => {
       <div class="providers">${list.map(providerCard).join("") || emptyHtml("这个分类下没有平台")}</div>`;
     $$("[data-filter]", el).forEach((b) => (b.onclick = () => { filter = state.modelFilter = b.dataset.filter; render(); }));
     $("#addCustom").onclick = () => configProvider(null);
+    $("#saveProxy").onclick = async () => {
+      await run(() => api("/api/settings", { ai_proxy: $("#aiProxy").value.trim() }), "已保存，下次调用 AI 时生效");
+      navigate("models", true);
+    };
     $$("[data-config]", el).forEach((b) => (b.onclick = () => configProvider(providers.find((p) => p.id === b.dataset.config))));
     $$("[data-toggle]", el).forEach((b) => (b.onclick = async () => {
       const p = providers.find((x) => x.id === b.dataset.toggle);
@@ -1609,7 +1618,7 @@ function keyTestPanel(t, p) {
   const stale = t.total !== p.key_count ? `<span class="muted">（Key 有变动，请重新测试）</span>` : "";
   const rows = t.keys.map((k) => `
     <div class="kt-row ${k.ok ? "good" : "bad"}"><span>${k.index} 号 <span class="mono">${esc(k.key)}</span> <span class="muted">(${k.length}位)</span> —</span>
-      ${k.ok ? `<b>✓ 可用</b> <span>(${k.ms}ms)</span>`
+      ${k.ok ? `<b>✓ 可用</b> <span>(${k.ms}ms${k.route ? " · 走" + esc(k.route) : ""})</span>`
         : `<b>✗ ${k.code ? k.code + " " : ""}${esc(k.hint)}</b> <span>(${k.ms}ms)</span> <span class="muted kt-err" title="${esc(k.error)}">${esc(k.error)}</span>`}
     </div>`).join("");
   const sample = t.reply ? `<div class="kt-reply muted">模型回复：${esc(t.reply)}</div>` : "";
