@@ -110,9 +110,12 @@ class BotHooks:
 
     def need_human(self, chat_id, buyer_name, message, reason):
         """机器人不回的聊天：记日志并提醒卖家本人去闲鱼里回复（同一个聊天 1 小时内只提醒一次）"""
-        if time.time() - self._human_notified.get(chat_id, 0) < 3600:
+        now = time.time()
+        if now - self._human_notified.get(chat_id, 0) < 3600:
             return
-        self._human_notified[chat_id] = time.time()
+        if len(self._human_notified) > 1000:
+            self._human_notified = {k: t for k, t in self._human_notified.items() if now - t < 3600}
+        self._human_notified[chat_id] = now
         try:
             notify.notify("message", "这条消息需要你本人回复", f"{buyer_name or '买家'}：{message}\n原因：{reason}")
         except Exception as e:

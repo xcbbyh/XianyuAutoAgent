@@ -322,9 +322,10 @@ class ChatContextManager:
 
         try:
             cursor.execute(
-                "SELECT chat_id, user_id, item_id FROM messages WHERE role = 'user' AND (chat_id = ? OR user_id = ?) "
+                # 只按会话 ID 找：按买家 ID 找会把付款算到这个人以前只是问过、没付款的别的聊天上
+                "SELECT chat_id, user_id, item_id FROM messages WHERE role = 'user' AND chat_id = ? "
                 "ORDER BY id DESC LIMIT 1",
-                (session_id, session_id)
+                (session_id,)
             )
             return cursor.fetchone()
         except Exception as e:

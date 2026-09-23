@@ -158,6 +158,12 @@ def mark_failed(r, error):
         _rollback(r)
 
 
+def mark_unconfirmed(r, note):
+    """写出去了但没收到闲鱼回执：标为发送失败让卖家去闲鱼确认，卡密不退回（可能已经发到买家手里）"""
+    store.execute("UPDATE pending_replies SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
+                  (str(note)[:300], time.time(), int(r["id"])))
+
+
 def requeue(r, reason):
     """已同意但发送时规则不允许（夜里、风控暂停、发太快）：退回待审核，卡密继续保留，之后可以再点同意"""
     store.execute("UPDATE pending_replies SET status = 'pending', error = ?, updated_at = ? WHERE id = ?",

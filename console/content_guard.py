@@ -7,6 +7,7 @@
 import difflib
 import re
 import time
+import unicodedata
 
 from . import safety, store
 
@@ -117,11 +118,22 @@ def _contains(text, word):
     return word in text
 
 
+def _squeeze(text):
+    """全角转半角、去掉空格和符号：「威 信」「支 付 宝」这类拆开写的也能认出来"""
+    return re.sub(r"[\s\W_]+", "", unicodedata.normalize("NFKC", text or ""))
+
+
 def banned_words(text, item_title=""):
     hits = []
+    text = text or ""
+    # 原文、全角转半角并去掉空格后的文字都查一遍（「Ｑ Ｑ」→「QQ」）
+    variants = (text, re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)))
+    squeezed = _squeeze(text)
     for label, words in BANNED:
         for w in words:
-            if _contains(text or "", w) and not (w == "全新" and "全新" in (item_title or "")):
+            found = any(_contains(v, w) for v in variants) or (not w.isascii() and not re.search(r"[\x00-\x7f]", w)
+                                                                and w in squeezed)
+            if found and not (w == "全新" and "全新" in (item_title or "")):
                 hits.append(f"{w}（{label}）")
     return hits
 

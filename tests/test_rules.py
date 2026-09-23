@@ -94,6 +94,9 @@ class ApprovalRules(Base):
         approvals.approve(rid)
 
     def test_banned_words(self):
+        for text in ("威 信聊", "Ｑ Ｑ号给你", "直接支 付 宝", "走外面转 账", "ｖｘ 123"):
+            self.assertTrue(content_guard.banned_words(text), text)
+        self.assertFalse(content_guard.banned_words("100元包邮"))
         self.assertTrue(content_guard.banned_words("加vx聊"))
         self.assertTrue(content_guard.banned_words("https://a.b"))
         self.assertTrue(content_guard.banned_words("加我QQ"))
@@ -203,11 +206,19 @@ class CookieWriteBack(unittest.TestCase):
 
 
 class FakeWS:
-    def __init__(self):
+    """假连接：记下发出的内容；receipt 不为 None 时像闲鱼一样回一个回执"""
+    def __init__(self, live=None, receipt=None):
         self.sent = []
+        self.live = live
+        self.receipt = receipt
 
     async def send(self, data):
-        self.sent.append(json.loads(data))
+        frame = json.loads(data)
+        self.sent.append(frame)
+        if self.live and self.receipt is not None:
+            mid = frame["headers"]["mid"]
+            asyncio.get_running_loop().call_soon(
+                self.live.check_send_receipt, {"code": self.receipt, "headers": {"mid": mid}})
 
 
 def make_live():
@@ -288,6 +299,7 @@ class BotFlow(Base):
         self.assertEqual(store.row("SELECT status FROM pending_replies WHERE id = ?", (rid,))["status"], "pending")
 
     def test_send_approved_sends_once(self):
+        self.live.ws = FakeWS(self.live, receipt=200)
         rid = self.queue("c8", "在的")
         approvals.approve(rid)
         r = approvals.claim_approved()[0]
@@ -295,6 +307,47 @@ class BotFlow(Base):
             asyncio.run(self.live.send_approved(r))
         self.assertEqual(len(self.live.ws.sent), 1)
         self.assertEqual(store.row("SELECT status FROM pending_replies WHERE id = ?", (rid,))["status"], "sent")
+        self.assertFalse(safety.is_paused())
+
+    def test_no_receipt_is_not_marked_sent_and_card_kept_out(self):
+        rules.save_delivery_rule({"name": "r", "item_id": "i1", "mode": "cards", "stock": "CARD-A\nCARD-B"})
+        d = self.live.hooks.take_delivery("c7", "i1", "", "b", "买家")
+        rid = self.queue("c7", d["content"], kind="delivery", delivery=d)
+        approvals.approve(rid)
+        r = approvals.claim_approved()[0]
+        with mock.patch.object(self.live.hooks, "human_delay", return_value=0), \
+                mock.patch.object(self.main, "RECEIPT_TIMEOUT", 0.2):
+            asyncio.run(self.live.send_approved(r))
+        row = store.row("SELECT status, error FROM pending_replies WHERE id = ?", (rid,))
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("不确定", row["error"])
+        # 卡密不退回库存（可能已经到了买家手里），也不能再点同意
+        self.assertEqual(rules.list_delivery_rules()[0]["stock"], ["CARD-B"])
+        with self.assertRaises(ValueError):
+            approvals.approve(rid)
+
+    def test_rejected_receipt_fails_and_pauses(self):
+        self.live.ws = FakeWS(self.live, receipt=403)
+        rid = self.queue("c6", "在的")
+        approvals.approve(rid)
+        r = approvals.claim_approved()[0]
+        with mock.patch.object(self.live.hooks, "human_delay", return_value=0):
+            asyncio.run(self.live.send_approved(r))
+        self.assertEqual(store.row("SELECT status FROM pending_replies WHERE id = ?", (rid,))["status"], "failed")
+        self.assertTrue(safety.is_paused())
+
+    def test_int_sender_id_is_still_me(self):
+        with mock.patch.object(self.live.xianyu, "get_item_info", return_value=self.item_api(MY_ID)):
+            self.run_message(self.live, self.main, chat_packet(int(MY_ID), "还在吗", "561"))
+        self.assertEqual(self.pending(), [])
+
+    def test_paid_notice_by_user_id_does_not_hit_old_chat(self):
+        rules.save_delivery_rule({"name": "r", "item_id": "562", "mode": "cards", "stock": "CARD-1"})
+        with mock.patch.object(self.live.xianyu, "get_item_info", return_value=self.item_api(MY_ID)):
+            self.run_message(self.live, self.main, chat_packet("2000", "这个还有吗", "562", chat="old"))
+        self.live.chat_meta.clear()
+        asyncio.run(self.live.handle_paid_order_notice("2000"))
+        self.assertEqual(store.rows("SELECT * FROM pending_replies WHERE kind = 'delivery'"), [])
 
     def test_rejected_send_receipt_trips_pause(self):
         asyncio.run(self.live.send_msg(self.live.ws, "c1", "b1", "在的"))

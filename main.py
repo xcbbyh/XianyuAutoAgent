@@ -22,6 +22,17 @@ from console import approvals, content_guard, safety
 ENV_PATH = os.getenv("ENV_FILE") or ".env"
 
 
+RECEIPT_TIMEOUT = 10  # 发出消息后等闲鱼回执的秒数
+
+
+class SendRejected(Exception):
+    """闲鱼回执不是 200"""
+
+
+class SendUnconfirmed(Exception):
+    """写进了连接，但没等到闲鱼的回执（连接可能刚好断了）"""
+
+
 class XianyuLive:
     def __init__(self, cookies_str):
         self.xianyu = XianyuApis()
@@ -71,8 +82,9 @@ class XianyuLive:
         self.ws_ready = False
         # 同意发送的回复一条一条发
         self.send_lock = asyncio.Lock()
-        # 发出去的消息 mid -> (会话, 时间)，用来核对闲鱼的回执
+        # 发出去的消息 mid -> (会话, 时间)，用来核对闲鱼的回执；mid -> 等回执的 future
         self.sent_mids = {}
+        self.receipts = {}
 
     async def refresh_token(self):
         """刷新token"""
@@ -333,7 +345,7 @@ class XianyuLive:
         for attempt in range(3):
             try:
                 # 等待期间连接可能已经重建，每次都取最新的连接
-                await self.send_msg(self.ws, chat_id, to_id, text)
+                mid = await self.send_msg(self.ws, chat_id, to_id, text)
                 break
             except Exception as e:
                 if attempt == 2:
@@ -343,7 +355,26 @@ class XianyuLive:
                     raise
                 logger.warning(f"发送消息失败，3 秒后重试: {e}")
                 await asyncio.sleep(3)
+        # 写进连接不等于闲鱼收到了：等闲鱼的回执再算发出
+        code = await self.wait_receipt(mid)
+        if code is not None and str(code) != "200":
+            raise SendRejected(f"闲鱼拒绝了这条消息（{code}）")
+        # 没收到回执时也先记进对话，免得再点同意重复发；由 send_approved 标记为「不确定是否发出」
         self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", text)
+        if code is None:
+            raise SendUnconfirmed("没有收到闲鱼的回执，不确定是否发出")
+
+    async def wait_receipt(self, mid):
+        """等闲鱼对这条消息的回执，返回状态码；超时返回 None"""
+        future = self.receipts.get(mid)
+        if future is None:
+            return None
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), RECEIPT_TIMEOUT)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self.receipts.pop(mid, None)
 
     def get_item_info_cached(self, item_id):
         """
@@ -408,6 +439,13 @@ class XianyuLive:
                 return
             try:
                 await self.send_reply(chat_id, r["buyer_id"], r["item_id"], r["reply"])
+            except SendUnconfirmed as e:
+                # 连接可能刚好断了。不回滚卡密、不能再点同意（避免重复发），请卖家去闲鱼里看；频率照样算一条
+                logger.warning(f"⚠️ {e}（会话 {chat_id}），请到闲鱼聊天里确认")
+                await asyncio.to_thread(approvals.mark_unconfirmed, r, f"{e}，请到闲鱼聊天里看一下；没发出的话请你本人在闲鱼里回复或发货")
+                self.hooks.event("delivery" if r["kind"] == "delivery" else
+                                 approvals.EVENT_OF_KIND.get(r["kind"], "ai_reply"), chat_id, r["reply"])
+                return
             except Exception as e:
                 logger.error(f"同意发送的回复没有发出去: {e}")
                 await asyncio.to_thread(approvals.mark_failed, r, e)
@@ -447,6 +485,7 @@ class XianyuLive:
         mid = generate_mid()
         # 记下这条消息的 mid：闲鱼对它的回执不是 200（被禁言、被限制）时要按风控处理
         self.sent_mids[mid] = (cid, time.time())
+        self.receipts[mid] = asyncio.get_running_loop().create_future()
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
@@ -484,6 +523,7 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
+        return mid
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -790,7 +830,7 @@ class XianyuLive:
                 return
 
             # 检查是否为卖家（自己）发送的消息
-            if send_user_id == self.myid:
+            if str(send_user_id) == str(self.myid):
                 # 机器人自动发出的消息会从服务器回传一次，发送时已经记录过，这里忽略
                 if self.is_own_echo(chat_id, send_message):
                     return
@@ -817,7 +857,14 @@ class XianyuLive:
 
             logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
             # 记住会话对应的买家和商品，订单状态通知只带会话 ID 时要用
+            self.chat_meta.pop(chat_id, None)
             self.chat_meta[chat_id] = (send_user_id, send_user_name, item_id)
+            if len(self.chat_meta) > 2000:
+                self.chat_meta.pop(next(iter(self.chat_meta)))
+            # 很久没动的会话锁清掉，长时间运行时内存不会一直涨
+            if len(self.chat_locks) > 2000:
+                for key in [k for k, lock in self.chat_locks.items() if not lock.locked() and k != chat_id][:1000]:
+                    del self.chat_locks[key]
 
             # 黑名单买家：不回复也不通知
             if self.hooks.is_blacklisted(send_user_id):
@@ -854,10 +901,14 @@ class XianyuLive:
             now = time.time()
             for mid in [m for m, (_, at) in self.sent_mids.items() if now - at > 300]:
                 del self.sent_mids[mid]
+                self.receipts.pop(mid, None)
             mid = (message_data.get("headers") or {}).get("mid")
             if mid not in self.sent_mids or "code" not in message_data:
                 return
             cid, _ = self.sent_mids.pop(mid)
+            future = self.receipts.get(mid)
+            if future is not None and not future.done():
+                future.set_result(message_data.get("code"))
             if str(message_data.get("code")) != "200":
                 detail = json.dumps(message_data, ensure_ascii=False)[:120]
                 logger.error(f"⛔ 闲鱼拒绝了发给会话 {cid} 的消息：{detail}")
@@ -869,7 +920,7 @@ class XianyuLive:
         """闲鱼系统发来的禁言/违规提醒：按风控信号处理（买家自己打的字不算）"""
         # 只认卡片/系统消息或没有发送人的消息；买家打一句「[你已被禁言]」不能让机器人停 24 小时
         system = self.is_card_message(message) or self.is_system_message(message) or not send_user_id
-        if system and send_user_id != self.myid and re.search(r"禁言|违规|限制(发布|私聊|聊天|交易)", send_message or ""):
+        if system and str(send_user_id) != str(self.myid) and re.search(r"禁言|违规|限制(发布|私聊|聊天|交易)", send_message or ""):
             logger.error(f"⛔ 收到闲鱼系统提醒：{send_message}")
             safety.trip(f"收到闲鱼系统提醒：{send_message[:60]}")
             return True
@@ -954,7 +1005,7 @@ class XianyuLive:
                     "Accept-Language": "zh-CN,zh;q=0.9",
                 }
 
-                async with websockets.connect(self.base_url, extra_headers=headers) as websocket:
+                async with websockets.connect(self.base_url, extra_headers=headers, max_size=16 * 2 ** 20) as websocket:
                     self.ws = websocket
                     await self.init(websocket)
                     
