@@ -275,6 +275,27 @@ def _platform_message(e):
     return str(e)[:160]
 
 
+NETWORK_CAUSES = [
+    (("getaddrinfo", "name or service not known", "11001", "nodename nor servname"), "域名解析失败（DNS），代理软件没有接管这个域名"),
+    (("10061", "refused"), "连接被拒绝，代理软件的端口可能没开"),
+    (("10054", "reset by peer", "forcibly closed", "unexpected_eof", "eof occurred", "remoteprotocolerror",
+      "server disconnected"), "连接被中途切断，多半是代理节点不可用，或者这个请求被直连出去后被拦截"),
+    (("certificate_verify_failed", "certificate verify failed"), "证书校验失败，代理软件可能在拦截 HTTPS"),
+    (("10060", "timed out"), "连接超时"),
+]
+
+
+def _root_cause(e):
+    """openai 只报「Connection error.」，真正的原因在它包着的底层异常里"""
+    seen, cur, last = set(), e, None
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if cur is not e and str(cur):
+            last = cur
+        cur = cur.__cause__ or cur.__context__
+    return f"{type(last).__name__}: {last}"[:200] if last else ""
+
+
 def _describe_error(e, provider):
     """把调用异常整理成「状态码 + 中文原因 + 原始信息」；网络问题和 Key 问题分开说"""
     code = getattr(e, "status_code", None)
@@ -295,7 +316,16 @@ def _describe_error(e, provider):
             hint = f"网络问题：{what}，请检查网络或接口地址"
     else:
         hint = "调用失败"
-    return {"code": code, "kind": kind, "hint": hint, "error": str(e)[:300], "detail": _platform_message(e)}
+    error = str(e)[:300]
+    if kind == "network":
+        cause = _root_cause(e)
+        if cause:
+            error = f"{error} 底层原因：{cause}"
+            low = cause.lower()
+            reason = next((text for keys, text in NETWORK_CAUSES if any(k in low for k in keys)), "")
+            if reason:
+                hint = f"{hint}（具体：{reason}）"
+    return {"code": code, "kind": kind, "hint": hint, "error": error, "detail": _platform_message(e)}
 
 
 def explain_error(e, provider):
