@@ -15,7 +15,7 @@ from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, gener
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from console.hooks import BotHooks
-from console import approvals, content_guard
+from console import approvals, content_guard, safety
 
 # Docker 里通过 ENV_FILE 把 .env 放进 data 目录，本地运行仍用当前目录的 .env
 ENV_PATH = os.getenv("ENV_FILE") or ".env"
@@ -137,6 +137,12 @@ class XianyuLive:
             record_user()
             return
 
+        # 出现过风控信号（禁言、滑块、发送失败）：所有自动功能停 24 小时，连草稿也不写
+        if safety.is_paused():
+            logger.warning("⛔ 防风控暂停中，不处理自动回复，请你本人在闲鱼里回复")
+            record_user()
+            return
+
         # 按闲鱼规则，这些聊天机器人不起草回复，交给你本人：活体动物等敏感商品、问「你是AI吗」、看不懂的「啥」「？」
         item_info = await asyncio.to_thread(self.get_item_info_cached, item_id)
         skip = content_guard.skip_reason(text, (item_info or {}).get("title", ""), (item_info or {}).get("desc", ""))
@@ -234,7 +240,11 @@ class XianyuLive:
                                    buyer_message, text)
             logger.info(f"📝 回复没有发出，已放进控制台「待审核回复」，等你点「同意发送」: {text}")
             return
-        await self.send_reply(chat_id, buyer_id, item_id, text)
+        try:
+            await self.send_reply(chat_id, buyer_id, item_id, text)
+        except Exception as e:
+            safety.trip(f"自动回复发送失败（{str(e)[:60]}），可能被禁言或触发风控")
+            raise
         self.hooks.event(approvals.EVENT_OF_KIND[kind], chat_id, text)
 
     async def handle_paid_order(self, chat_id, item_id, buyer_id, buyer_name):
@@ -264,6 +274,7 @@ class XianyuLive:
                 # 没发出去就把卡密退回库存，避免买家没收到、卡密却被扣掉
                 logger.error(f"自动发货消息发送失败，已退回库存，请手动发货: {e}")
                 self.hooks.rollback_delivery(delivery, buyer_name)
+                safety.trip(f"自动发货消息发送失败（{str(e)[:60]}），可能被禁言或触发风控")
                 return
             self.hooks.event("delivery", chat_id, f"已给 {buyer_name} 自动发货（商品 {item_title or item_id}）")
 
@@ -388,11 +399,16 @@ class XianyuLive:
         """发送控制台里点了「同意发送」的回复"""
         chat_id = r["chat_id"]
         async with self.chat_locks[chat_id]:
+            if r["kind"] != "delivery" and await asyncio.to_thread(safety.is_paused):
+                await asyncio.to_thread(approvals.mark_failed, r, "防风控暂停中，没有发送，请你本人在闲鱼里回复")
+                return
             try:
                 await self.send_reply(chat_id, r["buyer_id"], r["item_id"], r["reply"])
             except Exception as e:
                 logger.error(f"同意发送的回复没有发出去: {e}")
                 await asyncio.to_thread(approvals.mark_failed, r, e)
+                # 发送失败按风控信号处理：所有自动功能停 24 小时
+                await asyncio.to_thread(safety.trip, f"消息发送失败（{str(e)[:60]}），可能被禁言或触发风控")
                 return
             await asyncio.to_thread(approvals.mark_sent, r["id"])
             logger.info(f"✅ 已发送你同意的回复（会话 {chat_id}）: {r['reply']}")

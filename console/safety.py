@@ -9,6 +9,8 @@ import time
 
 from . import notify, store
 
+# 《闲鱼规则大全》第 14 节：每天最多上架 3 件、间隔至少 30 分钟；夜里 23:00-08:30 不做任何自动操作；
+# 出现风控信号全部停 24 小时。三个档位在这几项上都按这个规则，只在回复延迟、擦亮间隔上有区别。
 LEVELS = {
     "standard": {
         "label": "标准",
@@ -16,12 +18,12 @@ LEVELS = {
         "reply_delay_factor": 1.0,       # 自动回复延迟倍数（在固定的基础延迟上放大）
         "first_reply_extra": (0, 2),     # 新买家第一句话额外等待（秒）
         "buyer_hourly_limit": 30,        # 同一买家每小时最多自动回复条数，防止被人刷
-        "publish_daily_limit": 10,       # 每天最多自动上架数
-        "publish_interval_minutes": 5,   # 两次上架最短间隔
+        "publish_daily_limit": 3,       # 每天最多自动上架数
+        "publish_interval_minutes": 30,   # 两次上架最短间隔
         "polish_gap": (10, 30),          # 擦亮两个商品之间的间隔（秒）
-        "quiet_start": "00:30",          # 夜间静默：不执行擦亮和上架
-        "quiet_end": "07:00",
-        "pause_hours": 2,                # 触发风控后暂停后台任务的时长
+        "quiet_start": "23:00",          # 夜间静默：不执行擦亮和上架
+        "quiet_end": "08:30",
+        "pause_hours": 24,                # 触发风控后暂停后台任务的时长
     },
     "steady": {
         "label": "稳健（推荐）",
@@ -29,12 +31,12 @@ LEVELS = {
         "reply_delay_factor": 1.3,
         "first_reply_extra": (2, 5),
         "buyer_hourly_limit": 20,
-        "publish_daily_limit": 5,
-        "publish_interval_minutes": 15,
+        "publish_daily_limit": 3,
+        "publish_interval_minutes": 30,
         "polish_gap": (30, 90),
-        "quiet_start": "00:00",
-        "quiet_end": "08:00",
-        "pause_hours": 6,
+        "quiet_start": "23:00",
+        "quiet_end": "08:30",
+        "pause_hours": 24,
     },
     "cautious": {
         "label": "谨慎",
@@ -47,7 +49,7 @@ LEVELS = {
         "polish_gap": (60, 180),
         "quiet_start": "23:00",
         "quiet_end": "08:30",
-        "pause_hours": 12,
+        "pause_hours": 24,
     },
 }
 DEFAULT_LEVEL = "steady"
@@ -91,7 +93,7 @@ def is_paused():
 
 
 def trip(reason):
-    """触发熔断：暂停擦亮、上架等后台任务，并推送通知"""
+    """触发熔断：暂停自动回复、擦亮、上架等所有自动功能，并推送通知"""
     hours = params()["pause_hours"]
     until = time.time() + hours * 3600
     current = pause_state()
@@ -100,7 +102,7 @@ def trip(reason):
     store.save_settings({"safety_pause_until": until, "safety_pause_reason": reason})
     store.log_event("risk", "", f"防风控熔断：{reason}，后台任务暂停 {hours} 小时")
     notify.notify("risk", "防风控已暂停后台任务",
-                  f"{reason}\n擦亮、上架等任务已暂停 {hours} 小时。建议打开闲鱼网页版过一下滑块并更新 Cookie。")
+                  f"{reason}\n自动回复、擦亮、上架已全部暂停 {hours} 小时。建议打开闲鱼网页版过一下滑块并更新 Cookie。")
 
 
 def resume():
