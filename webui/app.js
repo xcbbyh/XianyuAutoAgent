@@ -140,6 +140,8 @@ const ICON_PATHS = {
   blacklist: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM5.6 5.6l12.8 12.8",
   delivery: "M3 7l9-4 9 4-9 4-9-4zm0 0v10l9 4 9-4V7M12 11v10",
   items: "M20 7H4v13h16V7zM16 7V4H8v3M4 12h16",
+  listings: "M12 5v14M5 12h14M4 4h16v16H4z",
+  safety: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3zm-3 9l2 2 4-4",
   chats: "M4 5h16v11H8l-4 4V5z",
   logs: "M5 4h14v16H5zM8 8h8M8 12h8M8 16h5",
   models: "M12 2l3 5 5 1-3.5 4 1 5.5L12 15l-5.5 2.5 1-5.5L4 8l5-1 3-5z",
@@ -154,9 +156,10 @@ const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColo
 const NAV = [
   ["总览", [["overview", "仪表盘"]]],
   ["客服中心", [["reply", "AI 自动回复"], ["keywords", "关键词回复"], ["prompts", "话术提示词"], ["blacklist", "黑名单"]]],
-  ["交易管理", [["delivery", "自动发货"], ["items", "商品库"]]],
+  ["商品与交易", [["items", "商品管理"], ["listings", "自动上架"], ["delivery", "自动发货"]]],
   ["数据中心", [["chats", "对话记录"], ["logs", "运行日志"]]],
   ["接入配置", [["models", "AI 模型"], ["account", "闲鱼账号"], ["notify", "消息通知"]]],
+  ["安全中心", [["safety", "防风控模式"]]],
   ["系统", [["system", "系统设置"]]],
 ];
 const PAGE_SUB = {
@@ -166,7 +169,9 @@ const PAGE_SUB = {
   prompts: "决定 AI 怎么说话、怎么议价",
   blacklist: "黑名单买家的消息不回复、不通知",
   delivery: "买家付款后自动发送虚拟商品内容或卡密",
-  items: "机器人接待过的商品",
+  items: "在售商品同步与自动擦亮",
+  listings: "写好商品排队自动发布，AI 帮写文案",
+  safety: "限速、静默、熔断，让自动化更像真人",
   chats: "每位买家的完整对话",
   logs: "机器人实时输出",
   models: "接入多个大模型，Key 轮换、失败自动切换",
@@ -260,6 +265,7 @@ function renderApp() {
 
 function navigate(page, force) {
   if (!force && state.dirty && !window.confirm("当前页面有未保存的修改，确定离开吗？")) return;
+  clearInterval(state.pagePoll);
   state.dirty = false;
   state.page = page;
   location.hash = page;
@@ -384,6 +390,7 @@ PAGES.overview = async (el) => {
   const niceMax = Math.ceil(max / 4) * 4;
   const hours = d.settings.business_hours;
   el.innerHTML = `
+    ${d.safety.pause.paused ? `<div class="banner bad"><div class="grow"><b>🛡️ 防风控熔断中，擦亮和上架已暂停</b><span class="muted">${esc(d.safety.pause.reason)}（${fmtTs(d.safety.pause.until)} 恢复）</span></div><button class="btn sm" data-go="safety">查看</button></div>` : ""}
     ${!d.bot.running ? `<div class="banner info"><div class="grow"><b>机器人未运行</b><span class="muted">配置好闲鱼账号和 AI 模型后，点右上角「启动机器人」开始自动接待。</span></div></div>` : ""}
     <div class="stats">
       ${[["今日买家消息", t.message], ["今日咨询买家", d.buyers_today], ["AI 回复", t.ai_reply], ["关键词回复", t.keyword_reply], ["付款订单", t.order], ["自动发货", t.delivery]]
@@ -423,7 +430,8 @@ PAGES.overview = async (el) => {
             ["营业时间", hours.enabled ? `<span class="badge info">${esc(hours.start)} - ${esc(hours.end)}</span>` : `<span class="badge">全天接待</span>`, "reply"],
             ["关键词回复", `<span class="badge ${d.counts.keywords ? "accent" : ""}">${d.counts.keywords} 条</span>`, "keywords"],
             ["自动发货", `<span class="badge ${d.counts.delivery ? "good" : ""}">${d.counts.delivery} 条规则</span>`, "delivery"],
-            ["防风控延迟", `<span class="badge good">固定开启</span>`, null],
+            ["防风控模式", d.safety.pause.paused ? `<span class="badge bad">熔断暂停中</span>` : `<span class="badge good">${esc(d.safety.params.label)}</span>`, "safety"],
+            ["自动擦亮", d.settings.auto_polish.enabled ? `<span class="badge good">每天 ${esc(d.settings.auto_polish.window_start)}-${esc(d.settings.auto_polish.window_end)}</span>` : `<span class="badge">未开启</span>`, "items"],
             ["异常自动重启", d.settings.auto_restart ? `<span class="badge good">已开启</span>` : `<span class="badge">已关闭</span>`, "system"],
           ].map(([name, badge, page]) => `<div class="check-item"><div class="grow"><b>${name}</b></div>${badge}
             ${page ? `<button class="btn sm ghost" data-go="${page}">设置</button>` : ""}</div>`).join("")}
@@ -633,25 +641,295 @@ PAGES.delivery = async (el) => {
   }, "删除")));
 };
 
-/* ---------------- 商品库 ---------------- */
+/* ---------------- 防风控模式 ---------------- */
+
+const SAFETY_ROWS = [
+  ["reply_delay_factor", "自动回复延迟", (v) => `基础延迟 × ${v}`],
+  ["first_reply_extra", "新买家首条回复额外等待", (v) => `${v[0]}～${v[1]} 秒`],
+  ["buyer_hourly_limit", "同一买家每小时自动回复上限", (v) => `${v} 条`],
+  ["publish_daily_limit", "每天自动上架上限", (v) => `${v} 个`],
+  ["publish_interval_minutes", "两次上架最短间隔", (v) => `${v} 分钟`],
+  ["polish_gap", "擦亮商品之间的间隔", (v) => `${v[0]}～${v[1]} 秒`],
+  ["quiet_start", "夜间静默（不擦亮、不上架）", (v, p) => `${p.quiet_start} - ${p.quiet_end}`],
+  ["pause_hours", "触发风控后暂停后台任务", (v) => `${v} 小时`],
+];
+
+PAGES.safety = async (el) => {
+  const st = await api("/api/safety");
+  const levels = Object.entries(st.levels);
+  el.innerHTML = `
+    ${st.pause.paused ? `<div class="banner bad"><div class="grow"><b>🛡️ 熔断中：擦亮、上架已暂停</b>
+      <span>${esc(st.pause.reason)}，将在 ${fmtTs(st.pause.until)} 自动恢复。建议先打开闲鱼网页版过一下滑块，再更新 Cookie。</span></div>
+      <button class="btn" id="resumeBtn">我已处理，立即恢复</button></div>`
+      : `<div class="banner info"><div class="grow"><b>🛡️ 防风控保护运行中</b>
+      <span class="muted">当前模式「${esc(st.params.label)}」${st.quiet ? " · 现在是夜间静默时段" : ""} · 今天已擦亮 ${st.today.polish} 次、自动上架 ${st.today.publish}/${st.params.publish_daily_limit} 个</span></div></div>`}
+    <div class="card">
+      <div class="card-head"><h3>选择防风控模式</h3><span class="desc">切换后立即生效，自动回复、擦亮、上架都会按新规则执行</span></div>
+      <div class="roadmap">${levels.map(([key, p]) => `
+        <div class="road level ${key === st.level ? "selected" : ""}" data-level="${key}" role="button" tabindex="0">
+          <b>${key === st.level ? `<span class="badge accent">当前</span>` : ""}${esc(p.label)}</b><p>${esc(p.desc)}</p></div>`).join("")}
+      </div>
+      <div class="table-wrap" style="margin-top:16px"><table>
+        <thead><tr><th>规则</th>${levels.map(([key, p]) => `<th class="${key === st.level ? "hl" : ""}">${esc(p.label)}</th>`).join("")}</tr></thead>
+        <tbody>${SAFETY_ROWS.map(([k, name, fmt]) => `<tr><td>${name}</td>${levels.map(([key, p]) => `<td class="${key === st.level ? "hl" : ""}">${esc(fmt(p[k], p))}</td>`).join("")}</tr>`).join("")}</tbody>
+      </table></div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <div class="card-head"><h3>始终开启的保护</h3><span class="desc">写在代码里，不能关闭</span></div>
+        <div class="checklist">${[
+          ["固定发送延迟", "每条自动回复都按字数模拟打字，最少等 1.5 秒，不会秒回"],
+          ["风控自动熔断", "闲鱼一旦要求滑块验证或返回风控码，立即暂停所有后台任务并推送通知"],
+          ["后台任务串行", "擦亮、上架一次只做一件事，顺序随机、间隔随机，每天的擦亮时间也随机"],
+          ["和网页端一致的请求", "使用与闲鱼网页版相同的签名方式和浏览器标识，不伪造设备、不切换 IP"],
+          ["防刷屏", "同一买家短时间消息过多自动停止回复并提醒你；同一订单不重复发货"],
+          ["敏感词过滤", "AI 回复中出现微信、QQ、支付宝等站外引导词会被替换，避免违规"],
+        ].map(([t, d]) => `<div class="check-item"><span class="ic ok">✓</span><div class="grow"><b>${t}</b><small>${d}</small></div></div>`).join("")}</div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>日常建议</h3></div>
+        <ol style="margin:0;padding-left:20px;color:var(--text-2);line-height:2">
+          <li>新账号先手动正常使用一两周，再逐步开启自动化，先用「谨慎」模式</li>
+          <li>一天内不要集中上架大量商品，同类商品标题和图片不要完全一样</li>
+          <li>控制台尽量放在你平时登录闲鱼的电脑和网络上运行</li>
+          <li>收到风控通知后，先在网页版过滑块、更新 Cookie，别急着恢复</li>
+          <li>擦亮每个商品每天一次就够，多擦没有用反而增加风险</li>
+          <li>自动化只能降低风险，无法保证绝对不被识别，请遵守闲鱼平台规则</li>
+        </ol>
+      </div>
+    </div>`;
+  $$("[data-level]", el).forEach((b) => (b.onclick = async () => {
+    if (b.dataset.level === st.level) return;
+    await run(() => api("/api/safety/level", { level: b.dataset.level }), "已切换防风控模式");
+    navigate("safety", true);
+  }));
+  $("#resumeBtn")?.addEventListener("click", () => confirmBox("确定已经在闲鱼网页版处理过验证了吗？过早恢复可能再次触发风控。", async () => {
+    await api("/api/safety/resume", {}); toast("已恢复"); navigate("safety", true);
+  }, "立即恢复"));
+};
+
+/* ---------------- 商品管理 ---------------- */
+
+function taskBar(task) {
+  if (!task || !task.name) return "";
+  return `<div class="banner ${task.running ? "info" : "warn"}" style="margin-bottom:16px"><div class="grow">
+    <b>${task.running ? "⏳ " : ""}${esc(task.name)}${task.running ? "进行中" : ""}</b><span class="muted">${esc(task.progress)}</span></div></div>`;
+}
 
 PAGES.items = async (el) => {
-  const items = await api("/api/items");
+  const tab = state.itemsTab || "mine";
+  const d = await api("/api/shop");
+  const conf = d.settings;
   el.innerHTML = `
+    <div id="taskBar">${taskBar(d.task)}</div>
+    <div class="tabs"><button data-tab="mine" class="${tab === "mine" ? "active" : ""}">我的在售商品</button>
+      <button data-tab="asked" class="${tab === "asked" ? "active" : ""}">买家咨询过的商品</button></div>
+    <div id="itemsBody"></div>`;
+  $$("[data-tab]", el).forEach((b) => (b.onclick = () => { state.itemsTab = b.dataset.tab; navigate("items", true); }));
+  const body = $("#itemsBody");
+  if (tab === "asked") {
+    const items = await api("/api/items");
+    body.innerHTML = `<div class="card">${items.length ? `<div class="table-wrap"><table><thead><tr><th>商品</th><th>价格</th><th>商品 ID</th><th>收录时间</th><th></th></tr></thead>
+      <tbody>${items.map((i) => `<tr><td><b>${esc(i.title) || "（无标题）"}</b><div class="muted clip">${esc(i.desc)}</div></td>
+        <td class="nowrap">¥ ${esc(i.price ?? "-")}</td><td class="mono">${esc(i.item_id)}</td><td class="nowrap">${fmtDb(i.last_updated)}</td>
+        <td class="actions">${itemActions(i.item_id)}</td></tr>`).join("")}</tbody></table></div>`
+      : emptyHtml("还没有商品。机器人运行并接待买家后，买家咨询的商品会自动出现在这里。")}</div>`;
+    bindItemActions(body);
+    return;
+  }
+  body.innerHTML = `
+    <form class="card" id="polishForm">
+      <div class="card-head"><h3>自动擦亮</h3><span class="desc">每天在时间窗口内随机挑一个时间，把所有在售商品擦亮一遍，提高曝光</span></div>
+      <div style="margin-bottom:16px">${switchHtml("enabled", conf.enabled, "开启每日自动擦亮")}</div>
+      <div class="grid-3">
+        <label class="field"><span>最早开始</span><input type="time" name="window_start" value="${esc(conf.window_start)}"></label>
+        <label class="field"><span>最晚开始</span><input type="time" name="window_end" value="${esc(conf.window_end)}"></label>
+        <label class="field"><span>今天的执行时间</span><input type="text" disabled value="${conf.enabled ? esc(d.next_polish || "等待控制台安排") : "未开启"}"></label>
+      </div>
+      <div class="help" style="margin:-6px 0 14px">商品之间会间隔 ${d.safety.params.polish_gap[0]}～${d.safety.params.polish_gap[1]} 秒（由防风控模式决定），夜间静默时段不执行。</div>
+      <button class="btn primary" type="submit">保存擦亮设置</button>
+    </form>
     <div class="card">
-      <div class="card-head"><h3>商品库</h3><span class="desc">有买家咨询过的商品会自动收录在这里，可直接为它创建规则</span></div>
-      ${items.length ? `<div class="table-wrap"><table><thead><tr><th>商品</th><th>价格</th><th>商品 ID</th><th>收录时间</th><th></th></tr></thead>
-        <tbody>${items.map((i) => `<tr>
-          <td><b>${esc(i.title) || "（无标题）"}</b><div class="muted clip">${esc(i.desc)}</div></td>
-          <td class="nowrap">¥ ${esc(i.price ?? "-")}</td><td class="mono">${esc(i.item_id)}</td><td class="nowrap">${fmtDb(i.last_updated)}</td>
-          <td class="actions"><a class="btn sm" href="https://www.goofish.com/item?id=${encodeURIComponent(i.item_id)}" target="_blank" rel="noopener">查看</a>
-            <button class="btn sm" data-kw="${esc(i.item_id)}">关键词规则</button><button class="btn sm" data-dl="${esc(i.item_id)}">发货规则</button></td>
-        </tr>`).join("")}</tbody></table></div>`
-      : emptyHtml("还没有商品。机器人运行并接待买家后，买家咨询的商品会自动出现在这里。")}
+      <div class="card-head"><h3>在售商品</h3><span class="desc">${d.items.length ? `共 ${d.items.length} 个` : "先点「同步在售商品」从闲鱼拉取"}</span>
+        <div class="actions"><button class="btn" id="syncBtn">同步在售商品</button><button class="btn primary" id="polishAll" ${d.items.length ? "" : "disabled"}>立即全部擦亮</button></div></div>
+      ${d.items.length ? `<div class="table-wrap"><table><thead><tr><th></th><th>商品</th><th>价格</th><th>最近擦亮</th><th></th></tr></thead>
+        <tbody>${d.items.map((i) => `<tr>
+          <td style="width:64px">${i.pic_url ? `<img src="${esc(i.pic_url)}" alt="" style="width:48px;height:48px;border-radius:8px;object-fit:cover" referrerpolicy="no-referrer">` : ""}</td>
+          <td><b>${esc(i.title)}</b><div class="muted mono" style="font-size:12px">${esc(i.item_id)}</div></td>
+          <td class="nowrap">${esc(i.price)}</td>
+          <td class="nowrap">${i.last_polished_at ? `${ago(i.last_polished_at)} · <span class="${i.last_polish_result === "成功" ? "" : "muted"}">${esc(i.last_polish_result)}</span>` : "-"}</td>
+          <td class="actions"><button class="btn sm" data-polish="${esc(i.item_id)}">擦亮</button>${itemActions(i.item_id)}</td></tr>`).join("")}
+        </tbody></table></div>` : emptyHtml("还没有同步商品")}
     </div>`;
-  $$("[data-kw]", el).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.kw; navigate("keywords"); setTimeout(() => $("#addKw")?.click(), 300); }));
-  $$("[data-dl]", el).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.dl; navigate("delivery"); setTimeout(() => $("#addRule")?.click(), 300); }));
+  trackDirty($("#polishForm"), (f) => api("/api/shop/settings", { enabled: f.enabled, window_start: f.window_start, window_end: f.window_end }));
+  $("#syncBtn").onclick = async () => { await run(() => api("/api/shop/sync", {}), "开始同步"); pollTask(); };
+  $("#polishAll").onclick = () => confirmBox(`现在擦亮全部 ${d.items.length} 个商品？会按防风控间隔逐个执行，大约需要 ${Math.ceil(d.items.length * (d.safety.params.polish_gap[0] + d.safety.params.polish_gap[1]) / 2 / 60)} 分钟。`, async () => {
+    await api("/api/shop/polish_all", {}); toast("开始擦亮"); pollTask();
+  }, "开始擦亮");
+  $$("[data-polish]", el).forEach((b) => (b.onclick = async () => {
+    b.disabled = true;
+    const r = await run(() => api("/api/shop/polish", { item_id: b.dataset.polish })).catch(() => null);
+    if (r) toast(r === "成功" ? "擦亮成功" : r, r === "成功" ? "ok" : "error");
+    navigate("items", true);
+  }));
+  bindItemActions(el);
+  if (d.task.running) pollTask();
 };
+
+function itemActions(itemId) {
+  return `<a class="btn sm" href="https://www.goofish.com/item?id=${encodeURIComponent(itemId)}" target="_blank" rel="noopener">查看</a>
+    <button class="btn sm" data-kw="${esc(itemId)}">关键词</button><button class="btn sm" data-dl="${esc(itemId)}">发货规则</button>`;
+}
+function bindItemActions(root) {
+  $$("[data-kw]", root).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.kw; navigate("keywords"); setTimeout(() => $("#addKw")?.click(), 300); }));
+  $$("[data-dl]", root).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.dl; navigate("delivery"); setTimeout(() => $("#addRule")?.click(), 300); }));
+}
+
+/* 后台任务进行中时，每 3 秒刷新一次任务进度，结束后刷新页面 */
+function pollTask() {
+  clearInterval(state.pagePoll);
+  const page = state.page;
+  state.pagePoll = setInterval(async () => {
+    const d = await api(page === "listings" ? "/api/listings" : "/api/shop").catch(() => null);
+    if (!d || state.page !== page) return clearInterval(state.pagePoll);
+    const bar = $("#taskBar");
+    if (bar) bar.innerHTML = taskBar(d.task);
+    if (!d.task.running) { clearInterval(state.pagePoll); if (!state.dirty) navigate(page, true); }
+  }, 3000);
+}
+
+/* ---------------- 自动上架 ---------------- */
+
+const LISTING_BADGE = { draft: "", queued: "info", publishing: "warn", published: "good", failed: "bad" };
+
+PAGES.listings = async (el) => {
+  const d = await api("/api/listings");
+  const sp = d.safety;
+  el.innerHTML = `
+    <div id="taskBar">${taskBar(d.task)}</div>
+    <div class="banner warn"><div class="grow"><b>自动上架（Beta）</b>
+      <span class="muted">排队中的商品由控制台按防风控规则逐个发布：今天已上架 ${sp.today.publish}/${sp.params.publish_daily_limit} 个，两次间隔至少 ${sp.params.publish_interval_minutes} 分钟，夜间 ${sp.params.quiet_start}-${sp.params.quiet_end} 不发布。
+      ${sp.publish_block ? `当前暂不能发布：<b style="display:inline">${esc(sp.publish_block)}</b>。` : "当前可以发布。"}
+      闲鱼账号需要先在 App 里设置过发货地址。建议先用一个商品试一次。</span></div></div>
+    <div class="card">
+      <div class="card-head"><h3>上架队列</h3><span class="desc">控制台要保持运行，排队的商品才会被发布</span>
+        <div class="actions"><button class="btn primary" id="newListing">＋ 新建商品</button></div></div>
+      ${d.listings.length ? `<div class="table-wrap"><table><thead><tr><th></th><th>商品</th><th>价格</th><th>状态</th><th>计划时间</th><th></th></tr></thead>
+        <tbody>${d.listings.map((l) => `<tr>
+          <td style="width:64px">${l.images[0] ? `<img src="/uploads/${esc(l.images[0])}" alt="" style="width:48px;height:48px;border-radius:8px;object-fit:cover">` : ""}</td>
+          <td><b>${esc(l.title)}</b><div class="muted clip">${esc(l.error || l.description)}</div></td>
+          <td class="nowrap">¥ ${esc(l.price)}</td>
+          <td><span class="badge ${LISTING_BADGE[l.status]}">${esc(l.status_label)}</span>${l.item_id ? `<div class="mono muted" style="font-size:12px">${esc(l.item_id)}</div>` : ""}</td>
+          <td class="nowrap">${l.status === "published" ? fmtTs(l.published_at) : l.scheduled_at ? fmtTs(l.scheduled_at) : "-"}</td>
+          <td class="actions">
+            ${l.status === "published" && l.item_id ? `<a class="btn sm" href="https://www.goofish.com/item?id=${encodeURIComponent(l.item_id)}" target="_blank" rel="noopener">查看</a>` : ""}
+            ${["draft", "failed"].includes(l.status) ? `<button class="btn sm teal" data-queue="${l.id}">加入队列</button>` : ""}
+            ${!["publishing", "published"].includes(l.status) ? `<button class="btn sm" data-edit="${l.id}">编辑</button>` : ""}
+            <button class="btn sm" data-copy="${l.id}">复制</button>
+            ${l.status !== "publishing" ? `<button class="btn sm danger" data-del="${l.id}">删除</button>` : ""}</td></tr>`).join("")}
+        </tbody></table></div>` : emptyHtml("还没有商品。点「新建商品」，可以让 AI 根据一句话帮你写标题和描述。")}
+    </div>`;
+  $("#newListing").onclick = () => editListing({}, d.delivery_choices);
+  const find = (id) => d.listings.find((l) => l.id == id);
+  $$("[data-edit]", el).forEach((b) => (b.onclick = () => editListing(find(b.dataset.edit), d.delivery_choices)));
+  $$("[data-copy]", el).forEach((b) => (b.onclick = () => { const l = { ...find(b.dataset.copy) }; delete l.id; editListing(l, d.delivery_choices); }));
+  $$("[data-queue]", el).forEach((b) => (b.onclick = async () => {
+    const l = find(b.dataset.queue);
+    const r = await run(() => api("/api/listings/save", { ...l, action: "publish" }));
+    toast(r.block ? `已加入队列，${r.block}，稍后自动发布` : "已加入队列，稍后自动发布");
+    navigate("listings", true);
+  }));
+  $$("[data-del]", el).forEach((b) => (b.onclick = () => confirmBox("删除这个商品草稿？（已上架的商品不会从闲鱼删除）", async () => {
+    await api("/api/listings/delete", { id: b.dataset.del }); toast("已删除"); navigate("listings", true);
+  }, "删除")));
+  if (d.task.running) pollTask();
+};
+
+function localInput(ts) {
+  const d = ts ? new Date(ts * 1000) : new Date(Date.now() + 3600e3);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function editListing(l, choices) {
+  let images = [...(l.images || [])];
+  const m = modal({
+    title: l.id ? "编辑商品" : "新建商品", wide: true, submitText: "确定",
+    body: `
+      <div class="banner info" style="margin-bottom:16px;display:block">
+        <b>✨ AI 帮写</b>
+        <div style="display:flex;gap:8px;margin-top:8px"><input type="text" id="aiBrief" placeholder="一句话描述，例如：九成新 iPad Air 5 64G 蓝色，带原装充电器，买了半年" style="flex:1">
+          <button type="button" class="btn primary" id="aiWrite">生成</button></div>
+        <div class="help">会用你在「AI 模型」里配置的模型写标题、描述和类目，生成后可以再改。</div>
+      </div>
+      <div class="section-title" style="margin-top:0">商品图片（最多 9 张，第一张是封面）</div>
+      <div id="imgList" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px"></div>
+      <label class="field"><span>标题</span><input type="text" name="title" maxlength="60" value="${esc(l.title)}" required></label>
+      <label class="field"><span>描述</span><textarea name="description" rows="6" required>${esc(l.description)}</textarea></label>
+      <div class="grid-3">
+        <label class="field"><span>售价（元）</span><input type="number" step="0.01" min="0" name="price" value="${esc(l.price ?? "")}" required></label>
+        <label class="field"><span>原价（可选）</span><input type="number" step="0.01" min="0" name="orig_price" value="${esc(l.orig_price ?? "")}"></label>
+        <label class="field"><span>类目提示（可选）</span><input type="text" name="category_hint" value="${esc(l.category_hint)}" placeholder="如：平板电脑"></label>
+      </div>
+      <div class="grid-3">
+        <label class="field"><span>运费</span><select name="delivery">${choices.map((c) => `<option ${l.delivery === c ? "selected" : ""}>${c}</option>`).join("")}</select></label>
+        <label class="field" data-post><span>邮费（元）</span><input type="number" step="0.01" min="0" name="post_price" value="${esc(l.post_price ?? "")}"></label>
+      </div>
+      <div class="section-title">保存方式</div>
+      <div style="margin-bottom:10px">
+        <label class="check"><input type="radio" name="action" value="draft" checked> 存为草稿</label>
+        <label class="check"><input type="radio" name="action" value="publish"> 加入上架队列（按防风控节奏尽快发布）</label>
+        <label class="check"><input type="radio" name="action" value="schedule"> 定时上架</label>
+      </div>
+      <label class="field hidden" data-when><span>上架时间</span><input type="datetime-local" name="when" value="${localInput(l.scheduled_at)}"></label>`,
+    onSubmit: async (f) => {
+      const action = m.form.querySelector("input[name=action]:checked").value;
+      const payload = { ...f, id: l.id, images, action };
+      delete payload.when;
+      if (action === "schedule") payload.scheduled_at = new Date(f.when).getTime() / 1000;
+      const r = await api("/api/listings/save", payload);
+      toast(action === "draft" ? "草稿已保存" : r.block ? `已加入队列（${r.block}，会自动顺延）` : "已加入上架队列");
+      navigate("listings", true);
+    },
+  });
+  const f = m.form;
+  const renderImgs = () => {
+    $("#imgList", f).innerHTML = images.map((img, i) => `
+      <div style="position:relative"><img src="/uploads/${esc(img)}" alt="" style="width:88px;height:88px;border-radius:10px;object-fit:cover;border:1px solid var(--border)">
+      ${i === 0 ? `<span class="badge accent" style="position:absolute;left:4px;top:4px">封面</span>` : ""}
+      <button type="button" class="btn sm danger" data-rmimg="${i}" style="position:absolute;right:4px;bottom:4px;height:22px;padding:0 6px">删</button></div>`).join("")
+      + (images.length < 9 ? `<label class="btn" style="width:88px;height:88px;flex-direction:column"><span style="font-size:22px">＋</span><span style="font-size:12px">上传</span>
+        <input type="file" accept="image/*" multiple hidden id="imgInput"></label>` : "");
+    $$("[data-rmimg]", f).forEach((b) => (b.onclick = () => { images.splice(Number(b.dataset.rmimg), 1); renderImgs(); }));
+    $("#imgInput", f)?.addEventListener("change", async (e) => {
+      for (const file of [...e.target.files].slice(0, 9 - images.length)) {
+        const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+        try { images.push(await api("/api/listings/upload", { name: file.name, data })); renderImgs(); }
+        catch (err) { toast(err.message, "error"); }
+      }
+    });
+  };
+  renderImgs();
+  const syncForm = () => {
+    $("[data-post]", f).classList.toggle("hidden", f.elements.delivery.value !== "一口价");
+    $("[data-when]", f).classList.toggle("hidden", f.querySelector("input[name=action]:checked").value !== "schedule");
+  };
+  f.elements.delivery.onchange = syncForm;
+  $$("input[name=action]", f).forEach((r) => (r.onchange = syncForm));
+  syncForm();
+  $("#aiWrite", f).onclick = async (e) => {
+    const btn = e.target;
+    btn.disabled = true; btn.textContent = "生成中…";
+    try {
+      const r = await api("/api/listings/ai_write", { brief: $("#aiBrief", f).value });
+      f.elements.title.value = r.title;
+      f.elements.description.value = r.description;
+      if (r.category_hint) f.elements.category_hint.value = r.category_hint;
+      toast("已生成，可以再修改");
+    } catch (err) { toast(err.message, "error"); }
+    btn.disabled = false; btn.textContent = "生成";
+  };
+}
 
 /* ---------------- 对话记录 ---------------- */
 
@@ -949,9 +1227,10 @@ const ROADMAP = [
   ["done", "营业时间与离线提示", ""],
   ["done", "消息通知", "钉钉 / 飞书 / 企业微信 / Bark / Server 酱"],
   ["done", "账号登录", "本地注册登录，多成员"],
-  ["done", "防风控延迟 + 并行处理", "固定开启，多买家互不排队"],
-  ["plan", "自动上架商品", "需要对接闲鱼发布接口，规划中"],
-  ["plan", "自动擦亮", "定时擦亮在售商品，规划中"],
+  ["done", "防风控模式", "三档限速、夜间静默、风控自动熔断"],
+  ["done", "自动擦亮", "每天随机时间、随机顺序擦亮在售商品"],
+  ["done", "自动上架", "草稿、定时、队列发布，AI 帮写文案（Beta）"],
+  ["done", "并行接待", "多买家互不排队，同一买家按顺序回复"],
   ["plan", "自动确认发货 / 自动评价", "规划中"],
   ["plan", "多闲鱼账号", "同时托管多个店铺，规划中"],
 ];

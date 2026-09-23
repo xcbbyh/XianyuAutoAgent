@@ -10,15 +10,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist ".deps_installed" (
-    echo 首次运行，正在安装依赖，请稍等...
-    python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-    if errorlevel 1 (
-        echo 依赖安装失败，请把上面的报错截图发给开发者
-        pause
-        exit /b 1
-    )
-    echo ok> .deps_installed
+echo 正在检查依赖，首次运行需要几分钟...
+python -m pip install -q -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+if errorlevel 1 (
+    echo 依赖安装失败，请把上面的报错截图发给开发者
+    pause
+    exit /b 1
 )
 
 python webui.py

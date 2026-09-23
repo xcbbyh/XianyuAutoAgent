@@ -116,7 +116,7 @@ class XianyuLive:
         """自动发送回复：固定带防风控延迟，并写入对话上下文"""
         if record:
             self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", text)
-        delay = self.hooks.human_delay(text)
+        delay = self.hooks.human_delay(text, chat_id)
         logger.info(f"模拟人工输入，延迟发送 {delay:.2f} 秒...")
         await asyncio.sleep(delay)
         await self.send_msg(ws, chat_id, to_id, text)
@@ -532,6 +532,12 @@ class XianyuLive:
             if self.is_manual_mode(chat_id):
                 logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
                 # 添加用户消息到上下文
+                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
+                return
+
+            # 防风控：同一买家短时间内自动回复过多时暂停
+            if not self.hooks.allow_reply(chat_id, send_user_name):
+                logger.warning(f"🛡️ 买家 {send_user_name} 一小时内自动回复已达上限，暂停自动回复")
                 self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
                 return
 
