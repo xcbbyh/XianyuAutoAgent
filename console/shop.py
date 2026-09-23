@@ -167,16 +167,25 @@ def start_sync():
 
 def save_image(name, data_url):
     """保存上传的图片（统一转成 JPEG，最长边不超过 2048）"""
+    text = str(data_url or "")
+    if "," in text and text.startswith("data:"):
+        text = text.split(",", 1)[1]
+    return _store_image(name, base64.b64decode(text))
+
+
+def import_image_file(path):
+    """把本地图片（例如网页截图）存成上架图片"""
+    with open(path, "rb") as f:
+        return _store_image(os.path.basename(path), f.read(), max_mb=40)
+
+
+def _store_image(name, raw, max_mb=10):
     try:
         from PIL import Image
     except ImportError:
         raise ValueError("缺少 Pillow 库，请重新运行「启动控制台.bat」自动安装依赖")
-    text = str(data_url or "")
-    if "," in text and text.startswith("data:"):
-        text = text.split(",", 1)[1]
-    raw = base64.b64decode(text)
-    if len(raw) > 10 * 1024 * 1024:
-        raise ValueError("单张图片不能超过 10MB")
+    if len(raw) > max_mb * 1024 * 1024:
+        raise ValueError(f"单张图片不能超过 {max_mb}MB")
     try:
         image = Image.open(io.BytesIO(raw))
         image = image.convert("RGB")

@@ -141,6 +141,7 @@ const ICON_PATHS = {
   delivery: "M3 7l9-4 9 4-9 4-9-4zm0 0v10l9 4 9-4V7M12 11v10",
   items: "M20 7H4v13h16V7zM16 7V4H8v3M4 12h16",
   listings: "M12 5v14M5 12h14M4 4h16v16H4z",
+  screenshots: "M4 8h3l2-3h6l2 3h3v11H4zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",
   safety: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3zm-3 9l2 2 4-4",
   chats: "M4 5h16v11H8l-4 4V5z",
   logs: "M5 4h14v16H5zM8 8h8M8 12h8M8 16h5",
@@ -156,7 +157,7 @@ const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColo
 const NAV = [
   ["总览", [["overview", "仪表盘"]]],
   ["客服中心", [["reply", "AI 自动回复"], ["keywords", "关键词回复"], ["prompts", "话术提示词"], ["blacklist", "黑名单"]]],
-  ["商品与交易", [["items", "商品管理"], ["listings", "自动上架"], ["delivery", "自动发货"]]],
+  ["商品与交易", [["items", "商品管理"], ["listings", "自动上架"], ["screenshots", "网页截图"], ["delivery", "自动发货"]]],
   ["数据中心", [["chats", "对话记录"], ["logs", "运行日志"]]],
   ["接入配置", [["models", "AI 模型"], ["account", "闲鱼账号"], ["notify", "消息通知"]]],
   ["安全中心", [["safety", "防风控模式"]]],
@@ -171,6 +172,7 @@ const PAGE_SUB = {
   delivery: "买家付款后自动发送虚拟商品内容或卡密",
   items: "在售商品同步与自动擦亮",
   listings: "写好商品排队自动发布，AI 帮写文案",
+  screenshots: "在浏览器里登录自己的网站，自动截图并按日期存好",
   safety: "限速、静默、熔断，让自动化更像真人",
   chats: "每位买家的完整对话",
   logs: "机器人实时输出",
@@ -904,8 +906,13 @@ function editListing(l, choices) {
       ${i === 0 ? `<span class="badge accent" style="position:absolute;left:4px;top:4px">封面</span>` : ""}
       <button type="button" class="btn sm danger" data-rmimg="${i}" style="position:absolute;right:4px;bottom:4px;height:22px;padding:0 6px">删</button></div>`).join("")
       + (images.length < 9 ? `<label class="btn" style="width:88px;height:88px;flex-direction:column"><span style="font-size:22px">＋</span><span style="font-size:12px">上传</span>
-        <input type="file" accept="image/*" multiple hidden id="imgInput"></label>` : "");
+        <input type="file" accept="image/*" multiple hidden id="imgInput"></label>
+        <button type="button" class="btn" id="fromShots" style="width:88px;height:88px;flex-direction:column"><span style="font-size:20px">📷</span><span style="font-size:12px">从截图选</span></button>` : "");
     $$("[data-rmimg]", f).forEach((b) => (b.onclick = () => { images.splice(Number(b.dataset.rmimg), 1); renderImgs(); }));
+    $("#fromShots", f)?.addEventListener("click", () => pickScreenshots((img) => {
+      if (images.length < 9) images.push(img);
+      renderImgs();
+    }).catch((err) => toast(err.message, "error")));
     $("#imgInput", f)?.addEventListener("change", async (e) => {
       for (const file of [...e.target.files].slice(0, 9 - images.length)) {
         const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
@@ -934,6 +941,150 @@ function editListing(l, choices) {
     } catch (err) { toast(err.message, "error"); }
     btn.disabled = false; btn.textContent = "生成";
   };
+}
+
+/* ---------------- 网页截图 ---------------- */
+
+const shotUrl = (date, file) => `/screenshots/${encodeURIComponent(date)}/${encodeURIComponent(file)}`;
+
+function shotResults(task) {
+  if (!task || (!task.running && !task.results.length && !task.progress)) return "";
+  const tone = task.running ? "info" : task.results.every((r) => r.ok && !r.warning) ? "good" : "warn";
+  return `<div class="shot-task ${tone}">
+    <b>${task.running ? "⏳ " : ""}${esc(task.progress)}</b>
+    ${task.results.map((r) => `<div class="${r.ok ? (r.warning ? "warn" : "good") : "bad"}">${r.ok ? "✓" : "✗"} ${esc(r.name)}
+      ${r.ok ? `— 已保存 <span class="mono">${esc(r.file)}</span>` : `— ${esc(r.error)}`}
+      ${r.warning ? ` ⚠ ${esc(r.warning)}` : ""} <span class="muted">(${r.seconds} 秒)</span></div>`).join("")}
+  </div>`;
+}
+
+PAGES.screenshots = async (el) => {
+  const d = await api("/api/screenshots");
+  let pages = d.pages.map((p) => ({ ...p }));
+  const open = d.browser.open;
+  el.innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>第一步：在浏览器里登录你的网站</h3>
+        <span class="desc">${open ? `<span class="badge good">浏览器已打开</span>` : `<span class="badge">浏览器未打开</span>`}</span></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input type="text" id="loginUrl" value="${esc(d.login_url)}" placeholder="你平台的网址，例如 https://www.example.com/" style="flex:1;min-width:240px">
+        <button class="btn primary" id="openLogin">打开浏览器登录</button>
+        ${open ? `<button class="btn" id="closeBrowser">关闭浏览器</button>` : ""}
+      </div>
+      <div class="help">会在你电脑上打开一个单独的浏览器窗口（优先用 Edge）。在里面<b>自己手动登录一次</b>，账号密码只在那个窗口里输入，控制台看不到。
+        登录状态保存在 <span class="mono">data/browser_profile</span>，下次不用再登录；登录过期了再点一次这个按钮重新登录即可。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>第二步：要截图的页面</h3><span class="desc">点「全部截图」会依次打开每个网址并截图</span>
+        <div class="actions"><button class="btn" id="addPage">＋ 添加页面</button><button class="btn" id="savePages">保存列表</button>
+          <button class="btn primary" id="captureAll">全部截图</button></div></div>
+      <div id="shotTask">${shotResults(d.browser.task)}</div>
+      <div id="pageRows"></div>
+      <div class="help">「整页」会把整个网页从上到下截成一张长图；「等待」是打开网页后再等几秒再截（网页加载慢时调大）；
+        「只截区域」可以留空，懂网页的话可以填 CSS 选择器只截某一块。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>截图文件</h3><span class="desc">按日期分文件夹保存在 <span class="mono">${esc(d.folder)}</span></span>
+        <div class="actions"><button class="btn" id="openFolder">打开文件夹</button></div></div>
+      ${d.days.length ? d.days.map((day) => `
+        <div class="section-title">${esc(day.date)}（${day.files.length} 张）</div>
+        <div class="shot-grid">${day.files.map((f) => `
+          <div class="shot"><a href="${shotUrl(day.date, f)}" target="_blank" rel="noopener"><img src="${shotUrl(day.date, f)}" alt="" loading="lazy"></a>
+            <div class="shot-name mono" title="${esc(f)}">${esc(f)}</div>
+            <button class="btn sm danger" data-delshot="${esc(day.date)}|${esc(f)}">删除</button></div>`).join("")}</div>`).join("")
+        : emptyHtml("还没有截图。先登录，再添加页面并点「全部截图」。")}
+    </div>`;
+
+  const renderRows = () => {
+    $("#pageRows").innerHTML = pages.length ? `<div class="table-wrap"><table><thead><tr><th>名称</th><th>网址</th><th>整页</th><th>等待(秒)</th><th>只截区域</th><th></th></tr></thead>
+      <tbody>${pages.map((p, i) => `<tr data-row="${i}">
+        <td><input type="text" data-k="name" value="${esc(p.name)}" placeholder="例如 首页" style="width:110px"></td>
+        <td><input type="text" data-k="url" value="${esc(p.url)}" placeholder="https://..." style="min-width:220px;width:100%"></td>
+        <td><input type="checkbox" data-k="full_page" ${p.full_page ? "checked" : ""}></td>
+        <td><input type="number" data-k="wait" min="0" max="60" step="0.5" value="${esc(p.wait ?? 2)}" style="width:70px"></td>
+        <td><input type="text" data-k="selector" value="${esc(p.selector || "")}" placeholder="可留空" style="width:110px"></td>
+        <td class="actions nowrap"><button class="btn sm" data-one="${i}">截这张</button><button class="btn sm danger" data-rm="${i}">删</button></td>
+      </tr>`).join("")}</tbody></table></div>` : emptyHtml("还没有页面，点右上角「添加页面」");
+    $$("[data-row] input").forEach((inp) => (inp.oninput = inp.onchange = () => {
+      const p = pages[inp.closest("[data-row]").dataset.row];
+      p[inp.dataset.k] = inp.type === "checkbox" ? inp.checked : inp.value;
+      state.dirty = true;
+    }));
+    $$("[data-rm]").forEach((b) => (b.onclick = () => { pages.splice(Number(b.dataset.rm), 1); state.dirty = true; renderRows(); }));
+    $$("[data-one]").forEach((b) => (b.onclick = () => capture([pages[b.dataset.one].name])));
+    $("#captureAll").disabled = !pages.length;
+  };
+  renderRows();
+
+  const saveConfig = async () => {
+    const r = await api("/api/screenshots/config", { login_url: $("#loginUrl").value, pages });
+    pages = r.pages.map((p) => ({ ...p }));
+    state.dirty = false;
+    return r;
+  };
+  const poll = () => {
+    clearInterval(state.pagePoll);
+    state.pagePoll = setInterval(async () => {
+      const s = await api("/api/screenshots/status").catch(() => null);
+      if (!s || state.page !== "screenshots") return clearInterval(state.pagePoll);
+      $("#shotTask").innerHTML = shotResults(s.task);
+      if (!s.task.running) { clearInterval(state.pagePoll); navigate("screenshots", true); }
+    }, 1500);
+  };
+  const capture = async (names) => {
+    try {
+      await saveConfig();
+      const t = await api("/api/screenshots/capture", { names });
+      $("#shotTask").innerHTML = shotResults(t);
+      poll();
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  $("#addPage").onclick = () => {
+    const base = $("#loginUrl").value.trim();
+    pages.push({ name: `页面${pages.length + 1}`, url: pages.length ? "" : base, full_page: false, wait: 2, selector: "" });
+    state.dirty = true; renderRows();
+  };
+  $("#savePages").onclick = () => run(saveConfig, "页面列表已保存").then(() => navigate("screenshots", true));
+  $("#captureAll").onclick = () => capture(null);
+  $("#openLogin").onclick = async (e) => {
+    const btn = e.target; btn.disabled = true; btn.textContent = "正在打开…";
+    try {
+      await saveConfig();
+      const r = await api("/api/screenshots/open", { url: $("#loginUrl").value });
+      toast(`已打开浏览器（${r.channel}），请在弹出的窗口里登录`);
+    } catch (err) { toast(err.message, "error"); }
+    navigate("screenshots", true);
+  };
+  $("#closeBrowser") && ($("#closeBrowser").onclick = async () => { await run(() => api("/api/screenshots/close", {}), "浏览器已关闭"); navigate("screenshots", true); });
+  $("#openFolder").onclick = () => run(() => api("/api/screenshots/folder", {}), "已在电脑上打开截图文件夹");
+  $$("[data-delshot]").forEach((b) => (b.onclick = async () => {
+    if (!window.confirm("确定删除这张截图吗？")) return;
+    const [date, file] = b.dataset.delshot.split("|");
+    await run(() => api("/api/screenshots/delete", { date, file }), "已删除");
+    navigate("screenshots", true);
+  }));
+  if (d.browser.task.running) poll();
+};
+
+async function pickScreenshots(onPick) {
+  const d = await api("/api/screenshots");
+  const files = d.days.flatMap((day) => day.files.map((f) => ({ date: day.date, file: f }))).slice(0, 60);
+  const m = modal({
+    title: "从网页截图里选图片", wide: true, submitText: "添加选中的图片",
+    body: files.length ? `<div class="help" style="margin:0 0 12px">点图片选中（可多选），第一张选中的会排在前面。</div>
+      <div class="shot-grid pick">${files.map((f, i) => `<label class="shot"><input type="checkbox" value="${i}" hidden>
+        <img src="${shotUrl(f.date, f.file)}" alt="" loading="lazy"><div class="shot-name mono">${esc(f.date)} ${esc(f.file)}</div></label>`).join("")}</div>`
+      : emptyHtml("还没有截图，请先到「网页截图」页面截图"),
+    onSubmit: async (_, form) => {
+      const chosen = [...form.querySelectorAll("input:checked")].map((c) => files[c.value]);
+      if (!chosen.length) throw new Error("请先点选图片");
+      for (const f of chosen) await onPick(await api("/api/listings/from_screenshot", f));
+    },
+  });
+  return m;
 }
 
 /* ---------------- 对话记录 ---------------- */
@@ -1171,7 +1322,16 @@ PAGES.account = async (el) => {
       <div class="help" style="margin-top:12px">Cookie 会过期；机器人运行时会自动续期，失效或触发风控时会在顶部提醒你，并推送到已配置的通知渠道。</div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>更新 Cookie</h3></div>
+      <div class="card-head"><h3>用浏览器登录，自动读取 Cookie（推荐）</h3></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="xyLogin">① 打开闲鱼登录</button>
+        <button class="btn primary" id="xyCookie">② 已登录，读取 Cookie</button>
+      </div>
+      <div class="help">点①会打开一个单独的浏览器窗口，在里面登录闲鱼（扫码或密码都行）；登录成功后回到这里点②，Cookie 会自动填好，不用按 F12 复制。
+        之后可以直接关掉那个浏览器窗口，<b>不要点退出登录</b>。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>更新 Cookie（手动粘贴）</h3></div>
       <form id="cookieForm">
         <label class="field"><span>粘贴完整 Cookie</span><textarea name="cookie" rows="5" class="mono" placeholder="cookie2=...; unb=...; ..." required></textarea></label>
         <button class="btn primary" type="submit">保存 Cookie</button>
@@ -1187,6 +1347,21 @@ PAGES.account = async (el) => {
         <li>粘贴到上面保存。之后直接关掉网页即可，<b>不要点退出登录</b>，否则 Cookie 会立即失效</li>
       </ol>
     </div>`;
+  $("#xyLogin").onclick = async (e) => {
+    const btn = e.target; btn.disabled = true; btn.textContent = "正在打开…";
+    try {
+      await api("/api/screenshots/xianyu_login", {});
+      toast("已打开浏览器，请在弹出的窗口里登录闲鱼");
+    } catch (err) { toast(err.message, "error"); }
+    btn.disabled = false; btn.textContent = "① 打开闲鱼登录";
+  };
+  $("#xyCookie").onclick = async () => {
+    try {
+      await api("/api/screenshots/xianyu_cookie", {});
+      toast("Cookie 已读取并保存，点右上角「重启」生效");
+      navigate("account", true);
+    } catch (err) { toast(err.message, "error"); }
+  };
   $("#cookieForm").onsubmit = async (e) => {
     e.preventDefault();
     await run(() => api("/api/account/cookie", formData(e.target)), "Cookie 已保存");

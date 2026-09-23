@@ -4,3 +4,4 @@ loguru==0.7.3
 python-dotenv==1.0.1
 requests==2.32.3
 Pillow>=10.0.0
+playwright>=1.49
