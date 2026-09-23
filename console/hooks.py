@@ -135,6 +135,17 @@ class BotHooks:
             logger.warning(f"查询我的商品失败：{e}")
             return False
 
+    @staticmethod
+    def known_item_text(item_id):
+        """同步过的「我的商品」或自己上架的商品的标题和描述（商品详情接口取不到时用）"""
+        try:
+            r = store.row("SELECT title, '' AS description FROM my_items WHERE item_id = ?", (str(item_id),)) or \
+                store.row("SELECT title, description FROM listings WHERE item_id = ? AND item_id != ''", (str(item_id),))
+            return (r["title"] or "", r["description"] or "") if r else ("", "")
+        except Exception as e:
+            logger.warning(f"查询我的商品失败：{e}")
+            return "", ""
+
     # ---------------- 规则 ----------------
 
     def is_blacklisted(self, user_id):

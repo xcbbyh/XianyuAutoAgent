@@ -51,8 +51,10 @@ class XianyuClient:
     def cookies(self):
         raw = self._cookie_loader()
         cookies = _parse_cookie(raw)
+        if not (raw or "").strip():
+            raise XianyuError("还没有填写闲鱼 Cookie，请到「闲鱼账号」页填写")
         if not cookies.get("unb"):
-            raise XianyuError("还没有填写有效的闲鱼 Cookie")
+            raise XianyuError("闲鱼 Cookie 里没有 unb（登录已失效或复制不完整），请在闲鱼网页版重新登录后再复制 Cookie")
         with self._lock:
             # 用户换了 Cookie（重新登录或换账号）时，丢弃之前接口返回的旧 token
             if raw != self._base:

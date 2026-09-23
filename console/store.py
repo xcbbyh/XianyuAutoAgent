@@ -12,7 +12,8 @@ import time
 from contextlib import contextmanager
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# XIANYU_DATA_DIR 只给自动测试用，平时不用设置
+DATA_DIR = os.getenv("XIANYU_DATA_DIR") or os.path.join(BASE_DIR, "data")
 # Docker 里设置 ENV_FILE=/app/data/.env，让 Cookie 等配置跟 data 目录一起保留
 ENV_PATH = os.getenv("ENV_FILE") or os.path.join(BASE_DIR, ".env")
 DB_PATH = os.path.join(DATA_DIR, "console.db")
@@ -166,7 +167,7 @@ DEFAULT_SETTINGS = {
         "start": "09:00",
         "end": "23:00",
         "mode": "away",  # away=发送离线提示，silent=不回复
-        "away_message": "亲，现在是非营业时间，看到消息后会第一时间回复您~",
+        "away_message": "我这会儿不在，看到了回你",
     },
     # 控制台启动时自动启动机器人
     "auto_start_bot": False,
@@ -184,6 +185,8 @@ DEFAULT_SETTINGS = {
     "screenshot_login_url": "",
     "screenshot_pages": [],
 }
+
+OLD_AWAY_MESSAGES = ("亲，现在是非营业时间，看到消息后会第一时间回复您~",)
 
 _schema_lock = threading.Lock()
 _schema_ready = False
@@ -252,6 +255,9 @@ def get_settings():
         if isinstance(default, dict):
             value = {**default, **(value if isinstance(value, dict) else {})}
         result[key] = value
+    # 旧版默认的离线提示有「第一」（极限词）和客服腔，审核时一定不过，没改过的换成新的默认话
+    if result["business_hours"].get("away_message") in OLD_AWAY_MESSAGES:
+        result["business_hours"]["away_message"] = DEFAULT_SETTINGS["business_hours"]["away_message"]
     return result
 
 

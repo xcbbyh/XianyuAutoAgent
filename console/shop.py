@@ -5,6 +5,7 @@
 后台调度线程每 30 秒检查一次：到点擦亮、按队列逐个上架。
 """
 import base64
+import difflib
 import io
 import json
 import os
@@ -25,7 +26,7 @@ LISTING_STATUS = {"draft": "草稿", "queued": "排队中", "publishing": "发�
 
 _client = None
 _task_lock = threading.Lock()
-_task_state = {"name": "", "progress": "", "running": False}
+_task_state = {"name": "", "progress": "", "running": False, "finished_at": None}
 
 
 def client():
@@ -40,11 +41,17 @@ def task_state():
     return dict(_task_state)
 
 
+def clear_task_error():
+    """换了 Cookie 之后，之前因为 Cookie 失败的提示不再显示，免得以为新 Cookie 也不行"""
+    if not _task_state["running"] and "Cookie" in (_task_state.get("progress") or ""):
+        _task_state.update(name="", progress="", finished_at=None)
+
+
 def _run_task(name, fn):
     """后台任务同一时间只跑一个，避免并发请求像机器"""
     if not _task_lock.acquire(blocking=False):
         raise ValueError(f"「{_task_state['name']}」正在进行中，请稍后")
-    _task_state.update(name=name, progress="开始", running=True)
+    _task_state.update(name=name, progress="开始", running=True, finished_at=None)
 
     def worker():
         try:
@@ -57,6 +64,7 @@ def _run_task(name, fn):
             logger.error(f"{name}出错：{e}")
         finally:
             _task_state["running"] = False
+            _task_state["finished_at"] = time.time()
             _task_lock.release()
 
     threading.Thread(target=worker, daemon=True).start()
@@ -110,6 +118,8 @@ def list_my_items():
 # ---------------- 擦亮 ----------------
 
 def polish_one(item_id):
+    if safety.in_quiet_hours():
+        raise ValueError("现在是防风控夜间静默时段，不执行擦亮")
     try:
         try:
             client().call("mtop.taobao.idle.item.polish", {"itemId": str(item_id)})
@@ -140,6 +150,8 @@ def polish_all(sync_first=True):
     for index, item in enumerate(items, 1):
         if safety.is_paused():
             raise RiskControlError("防风控熔断中")
+        if safety.in_quiet_hours():
+            raise RiskControlError("到了夜间静默时段，剩下的明天再擦亮")
         _task_state["progress"] = f"擦亮中 {index}/{len(items)}：{item['title'][:20]}"
         if polish_one(item["item_id"]) == "成功":
             ok += 1
@@ -263,6 +275,10 @@ def save_listing(payload):
     post = _num(payload.get("post_price"), "邮费", required=delivery == "一口价")
 
     status = "queued" if payload.get("action") in ("publish", "schedule") else "draft"
+    if status == "queued":
+        problems = listing_problems(title, description, payload.get("category_hint", ""), payload.get("id"))
+        if problems:
+            raise ValueError("不能上架：" + "；".join(problems))
     scheduled = None
     if payload.get("action") == "schedule":
         scheduled = _num(payload.get("scheduled_at"), "定时时间", required=True)
@@ -292,6 +308,27 @@ def save_listing(payload):
             (*values, time.time()),
         )
     return {"id": listing_id, "status": status, "block": safety.publish_block_reason() if status == "queued" else None}
+
+
+def listing_problems(title, description, category_hint="", listing_id=None):
+    """按《闲鱼规则大全》第 4、7、8、10 节检查上架文案：敏感类目不上架，违规词不能有，同款不重复发"""
+    from . import content_guard
+    problems = []
+    text = f"{title} {description} {category_hint or ''}"
+    hit = content_guard.SENSITIVE_ITEM.search(text)
+    if hit:
+        problems.append(f"商品涉及「{hit.group(0)}」（闲鱼的敏感类目），不能用控制台上架，请你本人在闲鱼 App 里确认能不能发")
+    words = content_guard.banned_words(f"{title}\n{description}", title)
+    if words:
+        problems.append("标题或描述里有闲鱼违规词：" + "、".join(words) + "，请改掉")
+    recent = store.rows("SELECT id, title, description FROM listings WHERE status IN ('queued', 'publishing', 'published') "
+                        "AND id != ? AND created_at > ?", (int(listing_id or 0), time.time() - 7 * 86400))
+    for r in recent:
+        if r["title"].strip() == title.strip() or difflib.SequenceMatcher(
+                None, r["description"] or "", description).ratio() >= 0.8:
+            problems.append(f"和 7 天内上架过的「{r['title'][:20]}」几乎一样，重复铺货会被降权，请换个写法或者别重复发")
+            break
+    return problems
 
 
 def delete_listing(listing_id):
@@ -432,6 +469,13 @@ def run_publish(listing_id):
     listing = store.row("SELECT * FROM listings WHERE id = ?", (int(listing_id),))
     if not listing or listing["status"] != "queued":
         return
+    # 更新前就排进队列的商品，发布前也按现在的规则再查一遍
+    problems = listing_problems(listing["title"], listing["description"], listing["category_hint"], listing["id"])
+    if problems:
+        store.execute("UPDATE listings SET status = 'failed', error = ? WHERE id = ?",
+                      (("没有上架：" + "；".join(problems))[:300], listing["id"]))
+        _task_state["progress"] = f"没有上架：{problems[0]}"
+        return
     store.execute("UPDATE listings SET status = 'publishing', error = '' WHERE id = ?", (listing["id"],))
     # 失败的尝试同样算一次操作，防止连续失败时频繁请求闲鱼
     store.log_event("publish_attempt", "", listing["title"])
@@ -496,8 +540,10 @@ CHAT_SYSTEM = (
     "你是闲鱼上架助手，帮卖家通过聊天把一件商品整理成可以直接发布的闲鱼商品。\n"
     "规则：\n"
     "1. 根据卖家说的话填写或修改商品草稿；卖家要求改哪里就只改哪里，其余保持不变。\n"
-    "2. 标题 15-30 个字，突出品牌型号、成色和卖点；描述 80-200 字，口语化，分几行写成色、配件、购买渠道/时间、出售原因、交易说明。\n"
-    "3. 不要编造卖家没提到的参数、成色和瑕疵；不要出现微信、QQ、手机号等站外联系方式。\n"
+    "2. 标题 15-30 个字，写清品牌型号和成色；描述 80-200 字，口语化，分几行写成色、配件、购买渠道/时间、出售原因、交易说明。\n"
+    "3. 不要编造卖家没提到的参数、成色和瑕疵；不要出现微信、QQ、手机号、链接等站外联系方式。"
+    "不用「最」「第一」「顶级」「极致」「必备」「100%」「绝对」这类极限词；卖家没说全新就不写全新；不写售后无忧、正品保证、一手货源、批发、代发、厂家、官方、七天无理由；不列一长串卖点，像个人卖闲置一样平实。"
+    "活体动物、药品、食品、烟酒、虚拟账号、证件票据、成人用品等敏感类目不帮忙写，在 reply 里说这类商品控制台不能上架。\n"
     "4. 售价只能用卖家说过或明确同意的价格；卖家没给价格时 price 填 null，并在 reply 里问他想卖多少（可以给一个参考区间）。\n"
     "5. delivery 只能是 包邮、按距离计费、一口价、无需邮寄 之一，默认 包邮；虚拟商品/卡密/服务类用 无需邮寄；"
     "选 一口价 时 post_price 填邮费。\n"
@@ -560,9 +606,10 @@ def _ai_complete(llm, brief):
         model="", temperature=0.7, max_tokens=800,
         messages=[
             {"role": "system", "content": (
-                "你是闲鱼资深卖家，擅长写真实、口语化、有吸引力的二手商品文案。"
-                "根据卖家给的信息写标题和描述，不要编造卖家没提到的参数和瑕疵情况，不要出现微信、QQ 等站外联系方式。"
-                "标题 15-30 个字，突出品牌型号、成色和卖点；描述 80-200 字，分几行写：成色、配件、购买渠道/时间、出售原因、交易说明。"
+                "你是在闲鱼上卖自己闲置的普通人，写真实、口语化的二手商品文案。"
+                "根据卖家给的信息写标题和描述，不要编造卖家没提到的参数和瑕疵情况，不要出现微信、QQ、链接等站外联系方式。"
+                "不用「最」「第一」「顶级」「极致」「必备」「100%」「绝对」这类极限词；卖家没说全新就不写全新；不写售后无忧、正品保证、一手货源、批发、代发、厂家、官方、七天无理由；不列一长串卖点，像个人卖闲置一样平实。"
+                "标题 15-30 个字，写清品牌型号和成色；描述 80-200 字，分几行写：成色、配件、购买渠道/时间、出售原因、交易说明。"
                 '只输出 JSON：{"title": "...", "description": "...", "category_hint": "商品类目，如 平板电脑"}')},
             {"role": "user", "content": brief},
         ],

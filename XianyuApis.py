@@ -58,6 +58,10 @@ class XianyuApis:
         try:
             # 获取当前cookies的字符串形式
             cookie_str = '; '.join([f"{cookie.name}={cookie.value}" for cookie in self.session.cookies])
+            # 登录失效时闲鱼会把 unb 等登录 Cookie 删掉，这时不能把残缺的 Cookie 写回去覆盖你填的那份
+            if not self.session.cookies.get('unb'):
+                logger.warning("当前 Cookie 里没有 unb（登录可能已失效），不写回 .env")
+                return
             
             # 读取.env文件
             env_path = os.getenv("ENV_FILE") or os.path.join(os.getcwd(), '.env')
@@ -70,10 +74,12 @@ class XianyuApis:
                 
             # 使用正则表达式替换COOKIES_STR的值
             if 'COOKIES_STR=' in env_content:
+                # 用函数替换：Cookie 里的反斜杠（比如昵称里的 \u）不会被当成正则转义
                 new_env_content = re.sub(
-                    r'COOKIES_STR=.*', 
-                    f'COOKIES_STR={cookie_str}',
-                    env_content
+                    r'^COOKIES_STR=.*$',
+                    lambda m: f'COOKIES_STR={cookie_str}',
+                    env_content,
+                    flags=re.M,
                 )
                 
                 # 写回.env文件

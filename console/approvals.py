@@ -9,6 +9,7 @@
 """
 import json
 import time
+from datetime import datetime
 
 from loguru import logger
 
@@ -62,7 +63,24 @@ def check(r, text=None):
                      (r["chat_id"], r["id"]))
     if busy:
         problems.append("这个聊天还有一条回复正在发送，请等它发完再点")
+    if r["kind"] != "delivery":
+        skip = content_guard.skip_reason(r.get("buyer_message") or "", r.get("item_title", ""))
+        if skip:
+            problems.append(skip)
+        if _answered_after(r):
+            problems.append("这条草稿之后，这个聊天里已经回过买家了（你本人或机器人），再发就是追着对方连发，请点「不发送」")
     return problems
+
+
+def _answered_after(r):
+    """草稿生成之后，这个聊天里是否已经有卖家发出的消息（你在闲鱼里手动回的也算）"""
+    since = datetime.fromtimestamp(r.get("created_at") or 0).isoformat()
+    if store.row("SELECT id FROM messages WHERE chat_id = ? AND role = 'assistant' AND timestamp > ? LIMIT 1",
+                 (r["chat_id"], since), path=store.CHAT_DB_PATH):
+        return True
+    return store.row("SELECT id FROM pending_replies WHERE chat_id = ? AND id != ? AND status = 'sent' "
+                     "AND kind != 'delivery' AND updated_at > ?",
+                     (r["chat_id"], r["id"], r.get("created_at") or 0)) is not None
 
 
 def _get(reply_id):
@@ -82,7 +100,7 @@ def approve(reply_id, text=None):
         if not reply:
             raise ValueError("回复内容不能为空")
     if r["status"] == "failed" and r["kind"] == "delivery":
-        raise ValueError("发货失败时卡密已经退回库存，请到闲鱼里手动发货")
+        raise ValueError("这条发货没有确认发出，不能再点同意（避免重复发卡密），请到闲鱼聊天里看一下，没发出就你本人手动发货")
     problems = check(r, reply)
     if problems:
         raise ValueError("；".join(problems))
@@ -115,9 +133,9 @@ def _rollback(r):
 
 # ---------------- 机器人调用 ----------------
 
-def claim_approved():
+def claim_approved(limit=10):
     """取出已同意的回复并标记为发送中（只有机器人进程调用）"""
-    rows = store.rows("SELECT * FROM pending_replies WHERE status = 'approved' ORDER BY id LIMIT 10")
+    rows = store.rows("SELECT * FROM pending_replies WHERE status = 'approved' ORDER BY id LIMIT ?", (int(limit),))
     claimed = []
     for r in rows:
         with store.db() as conn:
@@ -138,6 +156,12 @@ def mark_failed(r, error):
                   (str(error)[:300], time.time(), int(r["id"])))
     if r["kind"] == "delivery" and r["delivery"]:
         _rollback(r)
+
+
+def requeue(r, reason):
+    """已同意但发送时规则不允许（夜里、风控暂停、发太快）：退回待审核，卡密继续保留，之后可以再点同意"""
+    store.execute("UPDATE pending_replies SET status = 'pending', error = ?, updated_at = ? WHERE id = ?",
+                  (f"没有发出：{reason}"[:300], time.time(), int(r["id"])))
 
 
 def recover_sending():

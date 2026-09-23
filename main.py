@@ -68,6 +68,8 @@ class XianyuLive:
         self.chat_meta = {}
         # 当前连接是否可以发消息（「待审核回复」里同意发送的消息要等连接好了再发）
         self.ws_ready = False
+        # 同意发送的回复一条一条发
+        self.send_lock = asyncio.Lock()
 
     async def refresh_token(self):
         """刷新token"""
@@ -145,7 +147,13 @@ class XianyuLive:
 
         # 按闲鱼规则，这些聊天机器人不起草回复，交给你本人：活体动物等敏感商品、问「你是AI吗」、看不懂的「啥」「？」
         item_info = await asyncio.to_thread(self.get_item_info_cached, item_id)
-        skip = content_guard.skip_reason(text, (item_info or {}).get("title", ""), (item_info or {}).get("desc", ""))
+        title, desc = (item_info or {}).get("title", ""), (item_info or {}).get("desc", "")
+        if not title:
+            # 商品详情没取到时用同步过的「我的商品」标题；标题都不知道就没法判断是不是敏感类目，不起草
+            title, desc = self.hooks.known_item_text(item_id)
+        skip = content_guard.skip_reason(text, title, desc)
+        if not skip and not title:
+            skip = "查不到这个商品的标题，没法确认是不是敏感类目，机器人不回"
         if skip:
             logger.info(f"✋ {skip}（买家 {buyer_name}：{text}）")
             record_user()
@@ -196,9 +204,10 @@ class XianyuLive:
                 return
             logger.info("使用控制台设置的兜底话术回复")
 
-        # 检查是否需要回复
-        if bot_reply == "-":
+        # 检查是否需要回复（AI 输出「-」或只有标点）
+        if content_guard.is_blank(bot_reply):
             logger.info(f"[无需回复] 用户 {buyer_name} 的消息被识别为无需回复类型")
+            record_user()
             return
 
         # 添加用户消息到上下文
@@ -282,6 +291,17 @@ class XianyuLive:
             content_type = ((m1.get("6") or {}).get("3") or {}).get("4", 0)
             biz_tag = str((m1.get("10") or {}).get("bizTag", "") or "")
             return str(m1.get("7", 0)) == "1" or str(content_type) == "6" or "taskName" in biz_tag
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_card_message(message):
+        """闲鱼的卡片消息（已拍下、去支付、评价等），不是买家打的字，不回复"""
+        try:
+            m1 = message.get("1") or {}
+            content_type = ((m1.get("6") or {}).get("3") or {}).get("4", 0)
+            biz_tag = str((m1.get("10") or {}).get("bizTag", "") or "")
+            return str(content_type) == "6" or "taskName" in biz_tag
         except Exception:
             return False
 
@@ -375,9 +395,13 @@ class XianyuLive:
     async def send_approved(self, r):
         """发送控制台里点了「同意发送」的回复"""
         chat_id = r["chat_id"]
-        async with self.chat_locks[chat_id]:
-            if r["kind"] != "delivery" and await asyncio.to_thread(safety.is_paused):
-                await asyncio.to_thread(approvals.mark_failed, r, "防风控暂停中，没有发送，请你本人在闲鱼里回复")
+        # 一次只发一条：真人也是一条一条发；而且发之前的频率检查要看到上一条已经发出的记录才准
+        async with self.chat_locks[chat_id], self.send_lock:
+            # 同意之后到真正发出之间可能到了夜里、出现了风控暂停，或者发得太密：退回待审核，不发（自动发货也一样）
+            problems = await asyncio.to_thread(content_guard.send_time_problems, chat_id, r["kind"])
+            if problems:
+                logger.warning(f"⏸️ 这条回复暂时不能发，已退回「待审核回复」：{'；'.join(problems)}")
+                await asyncio.to_thread(approvals.requeue, r, "；".join(problems))
                 return
             try:
                 await self.send_reply(chat_id, r["buyer_id"], r["item_id"], r["reply"])
@@ -399,11 +423,12 @@ class XianyuLive:
         """每 2 秒看一下控制台有没有新同意发送的回复（只在连接正常时发送）"""
         while True:
             try:
-                if self.ws_ready and self.ws is not None:
-                    for r in await asyncio.to_thread(approvals.claim_approved):
-                        task = asyncio.create_task(self.send_approved(r))
-                        self.message_tasks.add(task)
-                        task.add_done_callback(self.message_tasks.discard)
+                # 一次只取一条、发完再取下一条：没轮到的保持「已同意」，机器人中途被关也不会被误标成发送中
+                while self.ws_ready and self.ws is not None:
+                    claimed = await asyncio.to_thread(approvals.claim_approved, 1)
+                    if not claimed:
+                        break
+                    await self.send_approved(claimed[0])
             except Exception as e:
                 logger.error(f"检查待发送回复失败: {e}")
             await asyncio.sleep(2)
@@ -801,8 +826,8 @@ class XianyuLive:
             if self.is_bracket_system_message(send_message):
                 logger.info(f"检测到系统消息：'{send_message}'，跳过自动回复")
                 return
-            if self.is_system_message(message):
-                logger.debug("系统消息，跳过处理")
+            if self.is_system_message(message) or self.is_card_message(message):
+                logger.debug("系统消息或卡片消息，跳过处理")
                 return
 
             self.hooks.event("message", chat_id, f"{send_user_name}：{send_message}")

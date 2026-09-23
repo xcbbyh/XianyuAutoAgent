@@ -824,7 +824,7 @@ PAGES.safety = async (el) => {
 function taskBar(task) {
   if (!task || !task.name) return "";
   return `<div class="banner ${task.running ? "info" : "warn"}" style="margin-bottom:16px"><div class="grow">
-    <b>${task.running ? "⏳ " : ""}${esc(task.name)}${task.running ? "进行中" : ""}</b><span class="muted">${esc(task.progress)}</span></div></div>`;
+    <b>${task.running ? "⏳ " : ""}${esc(task.name)}${task.running ? "进行中" : ""}</b><span class="muted">${esc(task.progress)}${task.finished_at ? `（${ago(task.finished_at)}）` : ""}</span></div></div>`;
 }
 
 PAGES.items = async (el) => {

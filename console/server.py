@@ -42,7 +42,7 @@ SESSION_COOKIE = "xy_session"
 PROMPTS = {
     "price_prompt": ("议价专家", "买家砍价时使用：写清底价、每轮最多让多少、什么情况下包邮"),
     "default_prompt": ("默认客服", "普通咨询时使用：说话风格、发货时间、售后规则"),
-    "tech_prompt": ("技术专家", "问参数、型号、对比时使用，会联网搜索（仅通义千问支持）"),
+    "tech_prompt": ("技术专家", "问参数、型号时使用：只按商品信息回答，不联网搜索"),
     "classify_prompt": ("意图分类", "判断买家意图的内部提示词，一般不需要改"),
 }
 
@@ -349,6 +349,7 @@ class BotProcess:
     def submit_cookie(self, cookie):
         """风控时机器人在等待输入新 Cookie，把它写进子进程的标准输入"""
         cookie = save_cookie(cookie)
+        shop.clear_task_error()
         if self.running() and self.awaiting_cookie:
             self.proc.stdin.write(cookie + "\n")
             self.proc.stdin.flush()

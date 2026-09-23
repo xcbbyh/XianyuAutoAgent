@@ -15,6 +15,12 @@ SENSITIVE_ITEM = re.compile(
     # 活体动物
     r"活体|幼犬|幼猫|宠物狗|宠物猫|狗狗|猫咪|小狗|小猫|边牧|边境牧羊|柯基|泰迪|金毛|拉布拉多|哈士奇|萨摩耶|柴犬|比熊|博美|"
     r"雪纳瑞|法斗|德牧|阿拉斯加|布偶猫|英短|美短|蓝猫|橘猫|暹罗|仓鼠|鹦鹉|乌龟|龟苗|观赏鱼|锦鲤|蜥蜴|守宫|猫舍|犬舍|种公|"
+    r"幼犬|狗崽|猫崽|奶猫|奶狗|宠物兔|垂耳兔|荷兰猪|龙猫|刺猬|雪貂|松鼠|八哥|玄凤|鸽子|雏鸟|鸟苗|金鱼|热带鱼|孔雀鱼|"
+    r"斗鱼|鱼苗|龙鱼|角蛙|爬宠|异宠|宠物蛇|玉米蛇|球蟒|蜘蛛|独角仙|蚂蚁工坊|蝎子|送养|领养|繁育|赛级|双血统|"
+    # 保护动物制品、黄赌毒、危险品
+    r"象牙|犀角|玳瑁|穿山甲|毒品|赌博|安全气囊|"
+    # 受限实物、虚拟课程
+    r"化妆品|内衣|网盘课程|"
     # 医药保健
     r"处方药|药品|药物|医疗器械|保健品|口罩|"
     # 食品、烟酒
@@ -25,8 +31,9 @@ SENSITIVE_ITEM = re.compile(
     r"成人用品|情趣|催情|仿真枪|水弹枪|管制刀具|弹药|易燃|易爆|高仿|A货|原单|空瓶")
 
 # 对方在要联系方式或骂人：不回，交给卖家本人
-ASK_CONTACT = re.compile(r"微信|VX|vx|V信|威信|QQ|qq|扣扣|企鹅|手机号|电话号|加你|加我|二维码|联系方式")
-INSULT = re.compile(r"傻[逼bB]|\bsb\b|\bSB\b|滚开|滚蛋|给我滚|神经病|你有病|骗子|垃圾东西|垃圾卖家|妈的|他妈|去死|脑残")
+ASK_CONTACT = re.compile(r"微信|VX|vx|Vx|V信|v信|威信|薇信|QQ|qq|扣扣|企鹅|手机号|电话号|加你|加我|加个[vV]|\+[vV]|"
+                         r"(?<![A-Za-z])(wx|WX)(?![A-Za-z])|二维码|联系方式")
+INSULT = re.compile(r"傻[逼bB]|(?<![A-Za-z])(sb|SB)(?![A-Za-z])|滚开|滚蛋|给我滚|神经病|你有病|骗子|垃圾东西|垃圾卖家|妈的|他妈|去死|脑残")
 
 # 对方在问是不是机器人：不回，提醒卖家本人接管
 ASK_BOT = re.compile(r"(你|您)是(不是)?(ai|AI|Ai|机器人|自动回复|人工智能|真人吗)|机器人吗|自动回复吗|是真人吗|是人吗")
@@ -79,6 +86,7 @@ MAX_PER_DAY = 10        # 同一个聊天每天最多 10 条
 MAX_PEOPLE_PER_HOUR = 15  # 全账号每小时最多给 15 个人自动回复
 NIGHT = ("23:00", "08:30")  # 夜里不发
 SIMILAR_RATIO = 0.8     # 和之前发过的话相似度超过 80% 就不发
+MAX_SAME_TEXT_PER_HOUR = 3  # 同一句话一小时内最多原样发给 3 个人
 
 SENT_TYPES = ("ai_reply", "keyword_reply", "away_reply")
 
@@ -96,16 +104,31 @@ def skip_reason(message, item_title="", item_desc=""):
     hit = SENSITIVE_ITEM.search(f"{item_title} {item_desc}")
     if hit:
         return f"商品涉及「{hit.group(0)}」（闲鱼的敏感类目），机器人不回，请你本人处理"
+    hit = SENSITIVE_ITEM.search(message or "")
+    if hit:
+        return f"对方的话涉及「{hit.group(0)}」（闲鱼的敏感类目），机器人不回，请你本人处理"
     return ""
+
+
+def _contains(text, word):
+    # 两个英文字母的短词（vx、qq、wx）前后不能紧挨着英文字母，免得随机卡密里的字母组合被误判
+    if len(word) <= 2 and word.isascii() and word.isalpha():
+        return re.search(rf"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])", text) is not None
+    return word in text
 
 
 def banned_words(text, item_title=""):
     hits = []
     for label, words in BANNED:
         for w in words:
-            if w in (text or "") and not (w == "全新" and "全新" in (item_title or "")):
+            if _contains(text or "", w) and not (w == "全新" and "全新" in (item_title or "")):
                 hits.append(f"{w}（{label}）")
     return hits
+
+
+def is_blank(text):
+    """AI 只输出了「-」或标点（表示不用回复），不能当成回复发出去"""
+    return not re.sub(r"[\s\-—–－_.。,，!！?？~～…·、]+", "", text or "")
 
 
 def humanize(text):
@@ -142,40 +165,81 @@ def recent_sent(chat_id, seconds):
         "ORDER BY created_at DESC", (str(chat_id), time.time() - seconds, *SENT_TYPES))
 
 
+def _pause_problem():
+    try:
+        pause = safety.pause_state()
+    except Exception as e:
+        return f"读不到防风控状态（{e}），为安全起见先不发"
+    if pause["paused"]:
+        return (f"出现过风控信号（{pause['reason'] or '被禁言或发送失败'}），所有自动功能暂停到 "
+                f"{time.strftime('%m-%d %H:%M', time.localtime(pause['until']))}，这段时间请你本人在闲鱼里回复")
+    return ""
+
+
+def is_night():
+    now = time.strftime("%H:%M")
+    return now >= NIGHT[0] or now < NIGHT[1]
+
+
+def _night_problem():
+    if is_night():
+        return f"夜里 {NIGHT[0]} 到 {NIGHT[1]} 不自动发消息，明天早上再点，或者你本人在闲鱼里回复"
+    return ""
+
+
+def _people_problem(chat_id, include_approved=True):
+    """全账号每小时最多给 15 个人自动回复；已同意、还在排队发送的也算上，防止一次同意一大批"""
+    chats = {r["chat_id"] for r in store.rows(
+        "SELECT DISTINCT chat_id FROM events WHERE created_at > ? AND chat_id != ? AND type IN (?, ?, ?)",
+        (time.time() - 3600, str(chat_id), *SENT_TYPES))}
+    if include_approved:
+        chats |= {r["chat_id"] for r in store.rows(
+            "SELECT DISTINCT chat_id FROM pending_replies WHERE status IN ('approved', 'sending') "
+            "AND kind != 'delivery' AND chat_id != ?", (str(chat_id),))}
+    if len(chats) >= MAX_PEOPLE_PER_HOUR:
+        return f"这一小时已经给 {len(chats)} 个人自动回复过（含已同意待发送的），全账号每小时最多 {MAX_PEOPLE_PER_HOUR} 人，请稍后再发"
+    return ""
+
+
+def _gap_problem(chat_id):
+    day = recent_sent(chat_id, MIN_GAP_SECONDS)
+    if day:
+        return f"这个聊天 {int(time.time() - day[0]['created_at'])} 秒前刚发过一条，两条之间至少隔 2 分钟，请稍后再点"
+    return ""
+
+
+def _normalize(text):
+    return re.sub(r"[\s，。,.!！?？~～…、]+", "", text or "")
+
+
 def check_reply(chat_id, text, item_title="", kind="ai"):
     """
     发出前的检查，返回问题列表（空列表表示可以发）。
-    自动发货内容（卡密）是买家付款后应得的，不做这些检查。
+    自动发货内容（卡密）不是聊天用语，不查 AI 腔和频率，但风控暂停、夜间、站外联系方式等违规词照样要查。
     """
-    if kind == "delivery":
-        return []
-    problems = []
-    try:
-        pause = safety.pause_state()
-        if pause["paused"]:
-            problems.append(f"出现过风控信号（{pause['reason'] or '被禁言或发送失败'}），所有自动功能暂停到 "
-                            f"{time.strftime('%m-%d %H:%M', time.localtime(pause['until']))}，这段时间请你本人在闲鱼里回复")
-    except Exception:
-        pass
-    now = time.strftime("%H:%M")
-    if now >= NIGHT[0] or now < NIGHT[1]:
-        problems.append(f"夜里 {NIGHT[0]} 到 {NIGHT[1]} 不自动发消息，明天早上再点，或者你本人在闲鱼里回复")
-    people = store.row(
-        "SELECT COUNT(DISTINCT chat_id) AS n FROM events WHERE created_at > ? AND chat_id != ? AND type IN (?, ?, ?)",
-        (time.time() - 3600, str(chat_id), *SENT_TYPES))["n"]
-    if people >= MAX_PEOPLE_PER_HOUR:
-        problems.append(f"这一小时已经给 {people} 个人自动回复过，全账号每小时最多 {MAX_PEOPLE_PER_HOUR} 人，请稍后再发")
+    problems = [p for p in (_pause_problem(), _night_problem()) if p]
     words = banned_words(text, item_title)
     if words:
-        problems.append("包含闲鱼敏感词：" + "、".join(words) + "，请改掉再发")
+        problems.append("包含闲鱼敏感词：" + "、".join(words) + ("，发货内容不能改，请点「不发送」后你本人在闲鱼里发货"
+                                                              if kind == "delivery" else "，请改掉再发"))
+    if kind == "delivery":
+        return problems
+    if is_blank(text):
+        problems.append("回复是空的")
+    hit = SENSITIVE_ITEM.search(item_title or "")
+    if hit:
+        problems.append(f"商品涉及「{hit.group(0)}」（闲鱼的敏感类目），机器人不回，请你本人处理")
+    people = _people_problem(chat_id)
+    if people:
+        problems.append(people)
     tone = ai_tone(text, item_title)
     if tone:
         problems.append("不像真人说话：" + "；".join(tone) + "，请改一改")
     day = recent_sent(chat_id, 86400)
     if day:
-        gap = time.time() - day[0]["created_at"]
-        if gap < MIN_GAP_SECONDS:
-            problems.append(f"这个聊天 {int(gap)} 秒前刚发过一条，两条之间至少隔 2 分钟，请稍后再点")
+        gap = _gap_problem(chat_id)
+        if gap:
+            problems.append(gap)
         if sum(1 for r in day if time.time() - r["created_at"] < 3600) >= MAX_PER_HOUR:
             problems.append(f"这个聊天一小时内已经自动发了 {MAX_PER_HOUR} 条，发太多容易被判骚扰，请你本人在闲鱼里回复")
         elif len(day) >= MAX_PER_DAY:
@@ -184,4 +248,21 @@ def check_reply(chat_id, text, item_title="", kind="ai"):
             if difflib.SequenceMatcher(None, r["detail"] or "", text or "").ratio() >= SIMILAR_RATIO:
                 problems.append("和这个聊天之前发过的一句话几乎一样，重复发容易被判垃圾信息，请改一改")
                 break
+    # 同一句话一小时内发给了好几个人：闲鱼会当成群发刷屏
+    same = sum(1 for r in store.rows(
+        "SELECT detail FROM events WHERE created_at > ? AND chat_id != ? AND type IN (?, ?, ?)",
+        (time.time() - 3600, str(chat_id), *SENT_TYPES)) if _normalize(r["detail"]) == _normalize(text))
+    if same >= MAX_SAME_TEXT_PER_HOUR:
+        problems.append(f"这句话一小时内已经原样发给了 {same} 个人，像群发，请换个说法")
+    return problems
+
+
+def send_time_problems(chat_id, kind):
+    """
+    同意之后真正发出之前再查一次会随时间变化的规则（同意时是白天、发的时候可能已经到夜里，
+    或者中间出现了风控暂停）。自动发货同样受风控暂停和夜间限制。
+    """
+    problems = [p for p in (_pause_problem(), _night_problem()) if p]
+    if kind != "delivery":
+        problems += [p for p in (_people_problem(chat_id, include_approved=False), _gap_problem(chat_id)) if p]
     return problems
