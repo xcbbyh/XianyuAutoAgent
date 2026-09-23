@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import dotenv_values, set_key
 
-from . import auth, notify, providers, rules, store
+from . import auth, notify, providers, rules, safety, shop, store
 
 BASE_DIR = store.BASE_DIR
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -262,8 +262,8 @@ class BotProcess:
                 self.online = False
             if "触发风控" in line:
                 self.awaiting_cookie = True
-                store.log_event("risk", "", "触发闲鱼风控，需要过滑块并更新 Cookie")
                 notify.notify("risk", "触发风控", "闲鱼要求滑块验证，请打开控制台更新 Cookie，否则机器人会停止")
+                safety.trip("机器人连接闲鱼时触发滑块验证")
             elif "Cookie已更新" in line:
                 self.awaiting_cookie = False
             if "Cookie已失效" in line:
@@ -360,6 +360,7 @@ def _overview():
         "account": account_info(),
         "model": {"name": active[0]["name"], "model": active[0]["model"], "count": len(active)} if active else None,
         "settings": store.get_settings(),
+        "safety": safety.status(),
         "counts": {
             "keywords": store.row("SELECT COUNT(*) AS n FROM keyword_rules WHERE enabled = 1")["n"],
             "delivery": store.row("SELECT COUNT(*) AS n FROM delivery_rules WHERE enabled = 1")["n"],
@@ -377,6 +378,14 @@ def _save_settings(payload, user):
     for field in ("start", "end"):
         if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(hours.get(field, ""))):
             raise ValueError("营业时间格式应为 HH:MM，例如 09:00")
+    polish = settings["auto_polish"]
+    for field in ("window_start", "window_end"):
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(polish.get(field, ""))):
+            raise ValueError("擦亮时间格式应为 HH:MM，例如 08:00")
+    if polish["window_start"] >= polish["window_end"]:
+        raise ValueError("擦亮时间窗口的结束时间要晚于开始时间")
+    if settings.get("safety_level") not in safety.LEVELS:
+        raise ValueError("防风控模式不正确")
     settings["manual_timeout_minutes"] = max(1, int(settings.get("manual_timeout_minutes") or 60))
     if not str(settings.get("toggle_keywords") or "").strip():
         raise ValueError("人工接管关键词不能为空")
@@ -415,6 +424,12 @@ GET_ROUTES = {
     "/api/messages": lambda q, u: chat_messages(q.get("chat_id", [""])[0]),
     "/api/items": lambda q, u: list_items(),
     "/api/users": lambda q, u: auth.list_users(),
+    "/api/safety": lambda q, u: safety.status(),
+    "/api/shop": lambda q, u: {"items": shop.list_my_items(), "task": shop.task_state(),
+                               "next_polish": shop.scheduler.next_polish_time(),
+                               "settings": store.get_settings()["auto_polish"], "safety": safety.status()},
+    "/api/listings": lambda q, u: {"listings": shop.list_listings(), "task": shop.task_state(),
+                                   "delivery_choices": shop.DELIVERY_CHOICES, "safety": safety.status()},
 }
 
 POST_ROUTES = {
@@ -444,6 +459,16 @@ POST_ROUTES = {
     "/api/users/create": lambda p, u: _require_admin(u) or auth.create_user(
         p.get("username"), p.get("password"), bool(p.get("is_admin"))),
     "/api/users/delete": lambda p, u: _require_admin(u) or auth.delete_user(p.get("id"), u["id"]),
+    "/api/safety/level": lambda p, u: _save_settings({"safety_level": p.get("level")}, u),
+    "/api/safety/resume": lambda p, u: safety.resume(),
+    "/api/shop/sync": lambda p, u: shop.start_sync(),
+    "/api/shop/polish_all": lambda p, u: shop.start_polish_all(),
+    "/api/shop/polish": lambda p, u: shop.polish_one(p.get("item_id", "")),
+    "/api/shop/settings": lambda p, u: _save_settings({"auto_polish": p}, u),
+    "/api/listings/upload": lambda p, u: shop.save_image(p.get("name", ""), p.get("data", "")),
+    "/api/listings/save": lambda p, u: shop.save_listing(p),
+    "/api/listings/delete": lambda p, u: shop.delete_listing(p.get("id")),
+    "/api/listings/ai_write": lambda p, u: shop.ai_write(p.get("brief", "")),
     "/api/users/password": lambda p, u: auth.change_password(u["id"], p.get("old_password"),
                                                              p.get("new_password")),
 }
@@ -482,6 +507,14 @@ class Handler(BaseHTTPRequestHandler):
             filename, content_type = STATIC_FILES[url.path]
             with open(os.path.join(STATIC_DIR, filename), "rb") as f:
                 return self._send(200, f.read(), content_type)
+        if url.path.startswith("/uploads/"):
+            if not auth.user_by_token(self._token()):
+                return self._send(401, {"error": "请先登录"})
+            try:
+                with open(shop.image_path(url.path.rsplit("/", 1)[-1]), "rb") as f:
+                    return self._send(200, f.read(), "image/jpeg")
+            except (ValueError, OSError):
+                return self._send(404, {"error": "not found"})
         if url.path == "/api/auth/state":
             user = auth.user_by_token(self._token())
             return self._send(200, {"has_users": auth.has_users(), "user": user})
@@ -554,6 +587,7 @@ def main():
     print(f" 闲鱼 AutoAgent 控制台已启动：{url}")
     print(" 请在浏览器里操作；这个窗口不要关（关掉机器人也会停）")
     print("=" * 56)
+    shop.scheduler.start()
     if store.get_settings().get("auto_start_bot"):
         try:
             bot.start()

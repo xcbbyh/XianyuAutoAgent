@@ -11,7 +11,7 @@ import time
 
 from loguru import logger
 
-from . import notify, rules, store
+from . import notify, rules, safety, store
 
 # 付款后闲鱼会在会话里推送这类系统卡片
 PAYMENT_PATTERN = re.compile(r"我已付款|已付款.{0,4}(待|等待).{0,2}发货|等待你发货|等待卖家发货")
@@ -30,6 +30,7 @@ class BotHooks:
         self._settings = None
         self._settings_time = 0
         self._away_sent = {}
+        self._throttled = {}
 
     def settings(self):
         # 缓存 3 秒：控制台改完配置几秒内生效，又不会每条消息都查库
@@ -54,10 +55,43 @@ class BotHooks:
     def fallback_reply(self):
         return (self.settings().get("fallback_reply") or "").strip()
 
-    @staticmethod
-    def human_delay(text):
+    def human_delay(self, text, chat_id=""):
+        """
+        固定的基础延迟 × 防风控模式倍数；新买家的第一句回复再多等一会儿（真人需要先看商品和消息）
+        """
         delay = random.uniform(*DELAY_BASE) + len(text or "") * random.uniform(*DELAY_PER_CHAR)
-        return min(delay, DELAY_MAX)
+        delay = min(delay, DELAY_MAX)
+        try:
+            p = safety.params()
+            delay *= p["reply_delay_factor"]
+            if chat_id and not store.row(
+                "SELECT id FROM events WHERE chat_id = ? AND type IN ('ai_reply', 'keyword_reply', 'away_reply') LIMIT 1",
+                (chat_id,),
+            ):
+                delay += random.uniform(*p["first_reply_extra"])
+        except Exception as e:
+            logger.warning(f"读取防风控配置失败：{e}")
+        return delay
+
+    def allow_reply(self, chat_id, buyer_name=""):
+        """同一买家一小时内自动回复过多时暂停回复，防止被刷消息或两个机器人互相对话"""
+        try:
+            limit = safety.params()["buyer_hourly_limit"]
+            count = store.row(
+                "SELECT COUNT(*) AS n FROM events WHERE chat_id = ? AND created_at > ? "
+                "AND type IN ('ai_reply', 'keyword_reply', 'away_reply')",
+                (chat_id, time.time() - 3600),
+            )["n"]
+        except Exception as e:
+            logger.warning(f"检查回复频率失败：{e}")
+            return True
+        if count < limit:
+            return True
+        if chat_id not in self._throttled or time.time() - self._throttled[chat_id] > 3600:
+            self._throttled[chat_id] = time.time()
+            notify.notify("message", "买家消息过多，已暂停自动回复",
+                          f"{buyer_name or chat_id} 一小时内已自动回复 {count} 条，达到防风控上限，请人工查看")
+        return False
 
     # ---------------- 规则 ----------------
 

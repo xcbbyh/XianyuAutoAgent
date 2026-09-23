@@ -1,0 +1,522 @@
+"""
+商品运营：同步在售商品、自动擦亮、自动上架（含定时队列）、AI 写文案
+
+所有闲鱼接口调用都受防风控模式约束：夜间静默、动作间隔、每日上限、风控熔断。
+后台调度线程每 30 秒检查一次：到点擦亮、按队列逐个上架。
+"""
+import base64
+import io
+import json
+import os
+import random
+import re
+import threading
+import time
+import uuid
+
+from loguru import logger
+
+from . import notify, safety, store
+from .xianyu_client import RiskControlError, XianyuClient, XianyuError
+
+UPLOAD_DIR = os.path.join(store.DATA_DIR, "uploads")
+DELIVERY_CHOICES = ("包邮", "按距离计费", "一口价", "无需邮寄")
+LISTING_STATUS = {"draft": "草稿", "queued": "排队中", "publishing": "发布中", "published": "已上架", "failed": "失败"}
+
+_client = None
+_task_lock = threading.Lock()
+_task_state = {"name": "", "progress": "", "running": False}
+
+
+def client():
+    global _client
+    if _client is None:
+        from .server import read_cookie
+        _client = XianyuClient(read_cookie)
+    return _client
+
+
+def task_state():
+    return dict(_task_state)
+
+
+def _run_task(name, fn):
+    """后台任务同一时间只跑一个，避免并发请求像机器"""
+    if not _task_lock.acquire(blocking=False):
+        raise ValueError(f"「{_task_state['name']}」正在进行中，请稍后")
+    _task_state.update(name=name, progress="开始", running=True)
+
+    def worker():
+        try:
+            fn()
+        except RiskControlError as e:
+            _task_state["progress"] = f"已停止：{e}"
+            logger.warning(f"{name}被防风控中止：{e}")
+        except Exception as e:
+            _task_state["progress"] = f"出错：{e}"
+            logger.error(f"{name}出错：{e}")
+        finally:
+            _task_state["running"] = False
+            _task_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ---------------- 在售商品 ----------------
+
+def sync_items():
+    """拉取自己的在售商品列表，保存到 my_items"""
+    uid = client().user_id
+    items, page = [], 1
+    while page <= 20:
+        data = client().call("mtop.idle.web.xyh.item.list", {
+            "needGroupInfo": False, "pageNumber": page, "pageSize": 20,
+            "groupName": "在售", "groupId": "58877261", "defaultGroup": True, "userId": uid,
+        })
+        cards = data.get("cardList") or []
+        for card in cards:
+            d = card.get("cardData") or {}
+            if not d.get("id"):
+                continue
+            price = d.get("priceInfo") or {}
+            items.append({
+                "item_id": str(d["id"]), "title": d.get("title", ""),
+                "price": f"{price.get('preText', '')}{price.get('price', '')}",
+                "pic_url": (d.get("picInfo") or {}).get("picUrl", ""),
+                "status": str(d.get("itemStatus", "")),
+            })
+        if len(cards) < 20:
+            break
+        page += 1
+        time.sleep(random.uniform(1.5, 3.5))
+    now = time.time()
+    with store.db() as conn:
+        for i in items:
+            conn.execute(
+                "INSERT INTO my_items (item_id, title, price, pic_url, status, synced_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(item_id) DO UPDATE SET title = excluded.title, price = excluded.price, "
+                "pic_url = excluded.pic_url, status = excluded.status, synced_at = excluded.synced_at",
+                (i["item_id"], i["title"], i["price"], i["pic_url"], i["status"], now),
+            )
+        # 同步不到的商品视为已下架/已售出
+        conn.execute("DELETE FROM my_items WHERE synced_at < ?", (now - 1,))
+    return len(items)
+
+
+def list_my_items():
+    return store.rows("SELECT * FROM my_items ORDER BY synced_at DESC, title")
+
+
+# ---------------- 擦亮 ----------------
+
+def polish_one(item_id):
+    try:
+        try:
+            client().call("mtop.taobao.idle.item.polish", {"itemId": str(item_id)})
+        except RiskControlError:
+            raise
+        except XianyuError:
+            # 部分账号走新版接口
+            client().call("mtop.idle.item.polish", {"itemId": str(item_id)})
+        result = "成功"
+        store.log_event("polish", "", f"擦亮商品 {item_id}")
+    except RiskControlError:
+        raise
+    except XianyuError as e:
+        result = f"失败：{e}"
+    store.execute("UPDATE my_items SET last_polished_at = ?, last_polish_result = ? WHERE item_id = ?",
+                  (time.time(), result, str(item_id)))
+    return result
+
+
+def polish_all(sync_first=True):
+    if sync_first:
+        _task_state["progress"] = "正在同步在售商品"
+        sync_items()
+    items = list_my_items()
+    ok = 0
+    gap = safety.params()["polish_gap"]
+    random.shuffle(items)  # 打乱顺序，避免每天同样的节奏
+    for index, item in enumerate(items, 1):
+        if safety.is_paused():
+            raise RiskControlError("防风控熔断中")
+        _task_state["progress"] = f"擦亮中 {index}/{len(items)}：{item['title'][:20]}"
+        if polish_one(item["item_id"]) == "成功":
+            ok += 1
+        if index < len(items):
+            time.sleep(random.uniform(*gap))
+    _task_state["progress"] = f"擦亮完成：成功 {ok}/{len(items)}"
+    logger.info(_task_state["progress"])
+    return ok, len(items)
+
+
+def start_polish_all():
+    if safety.in_quiet_hours():
+        raise ValueError("现在是防风控夜间静默时段，不执行擦亮")
+    _run_task("批量擦亮", polish_all)
+
+
+def start_sync():
+    def job():
+        n = sync_items()
+        _task_state["progress"] = f"同步完成：{n} 个在售商品"
+    _run_task("同步在售商品", job)
+
+
+# ---------------- 上架草稿 ----------------
+
+def save_image(name, data_url):
+    """保存上传的图片（统一转成 JPEG，最长边不超过 2048）"""
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ValueError("缺少 Pillow 库，请重新运行「启动控制台.bat」自动安装依赖")
+    text = str(data_url or "")
+    if "," in text and text.startswith("data:"):
+        text = text.split(",", 1)[1]
+    raw = base64.b64decode(text)
+    if len(raw) > 10 * 1024 * 1024:
+        raise ValueError("单张图片不能超过 10MB")
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image = image.convert("RGB")
+    except Exception:
+        raise ValueError(f"{name} 不是有效的图片")
+    image.thumbnail((2048, 2048))
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}.jpg"
+    image.save(os.path.join(UPLOAD_DIR, filename), format="JPEG", quality=88)
+    return filename
+
+
+def image_path(filename):
+    if not re.fullmatch(r"[0-9a-f]{32}\.jpg", filename or ""):
+        raise ValueError("图片不存在")
+    return os.path.join(UPLOAD_DIR, filename)
+
+
+def list_listings():
+    result = []
+    for r in store.rows("SELECT * FROM listings ORDER BY id DESC"):
+        r["images"] = json.loads(r["images"] or "[]")
+        r["status_label"] = LISTING_STATUS.get(r["status"], r["status"])
+        result.append(r)
+    return result
+
+
+def _num(value, name, required=False):
+    if value in (None, ""):
+        if required:
+            raise ValueError(f"请填写{name}")
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}格式不正确")
+    if number < 0:
+        raise ValueError(f"{name}不能为负数")
+    return number
+
+
+def save_listing(payload):
+    title = str(payload.get("title", "")).strip()
+    description = str(payload.get("description", "")).strip()
+    images = [i for i in payload.get("images", []) if i]
+    delivery = payload.get("delivery", "包邮")
+    if not title:
+        raise ValueError("请填写商品标题")
+    if len(title) > 60:
+        raise ValueError("标题不能超过 60 个字")
+    if not description:
+        raise ValueError("请填写商品描述")
+    if not images:
+        raise ValueError("请至少上传一张图片")
+    if len(images) > 9:
+        raise ValueError("最多 9 张图片")
+    for img in images:
+        if not os.path.exists(image_path(img)):
+            raise ValueError("有图片已丢失，请重新上传")
+    if delivery not in DELIVERY_CHOICES:
+        raise ValueError("运费方式不正确")
+    price = _num(payload.get("price"), "售价", required=True)
+    orig = _num(payload.get("orig_price"), "原价")
+    post = _num(payload.get("post_price"), "邮费", required=delivery == "一口价")
+
+    status = "queued" if payload.get("action") in ("publish", "schedule") else "draft"
+    scheduled = None
+    if payload.get("action") == "schedule":
+        scheduled = _num(payload.get("scheduled_at"), "定时时间", required=True)
+        if scheduled < time.time() - 60:
+            raise ValueError("定时时间不能早于现在")
+    elif status == "queued":
+        scheduled = time.time()
+
+    values = (title, description, price, orig, delivery, post, str(payload.get("category_hint", "")).strip(),
+              json.dumps(images), status, scheduled)
+    if payload.get("id"):
+        current = store.row("SELECT status FROM listings WHERE id = ?", (int(payload["id"]),))
+        if not current:
+            raise ValueError("草稿不存在")
+        if current["status"] in ("publishing", "published"):
+            raise ValueError("已上架的商品不能再编辑，请到闲鱼里修改")
+        store.execute(
+            "UPDATE listings SET title = ?, description = ?, price = ?, orig_price = ?, delivery = ?, post_price = ?, "
+            "category_hint = ?, images = ?, status = ?, scheduled_at = ?, error = '' WHERE id = ?",
+            (*values, int(payload["id"])),
+        )
+        listing_id = int(payload["id"])
+    else:
+        listing_id = store.execute(
+            "INSERT INTO listings (title, description, price, orig_price, delivery, post_price, category_hint, images, "
+            "status, scheduled_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*values, time.time()),
+        )
+    return {"id": listing_id, "status": status, "block": safety.publish_block_reason() if status == "queued" else None}
+
+
+def delete_listing(listing_id):
+    r = store.row("SELECT images, status FROM listings WHERE id = ?", (int(listing_id),))
+    if not r:
+        return
+    if r["status"] == "publishing":
+        raise ValueError("正在发布中，稍后再删")
+    store.execute("DELETE FROM listings WHERE id = ?", (int(listing_id),))
+
+
+def _category(title, description, images, hint):
+    rec_title, rec_desc = title, description
+    if hint:
+        rec_title = f"{hint} {title}"[:120] if hint not in title else title
+        rec_desc = f"类目提示：{hint}\n{description}"
+    data = client().call("mtop.taobao.idle.kgraph.property.recommend", {
+        "title": rec_title, "description": rec_desc, "lockCpv": False, "multiSKU": False,
+        "publishScene": "mainPublish", "scene": "newPublishChoice",
+        "imageInfos": [_image_info(i) for i in images], "uniqueCode": str(int(time.time() * 1e6)),
+    }, version="2.0", spm_cnt="a21ybx.publish.0.0")
+    predict = data.get("categoryPredictResult") or {}
+    category = {k: str(predict.get(k) or "") for k in ("catId", "catName", "channelCatId", "tbCatId")}
+    if not all(category.values()):
+        raise XianyuError("闲鱼没能识别商品类目，请把标题写得更具体，或填写「类目提示」后重试")
+    return category, data.get("cardList") or []
+
+
+def _labels(cards):
+    """把类目推荐里默认选中的属性带上，和网页端手动发布一致"""
+    labels = []
+    for card in cards:
+        d = card.get("cardData") or {}
+        chosen = next((v for v in d.get("valuesList") or [] if v.get("isClicked")), None)
+        if not chosen or not chosen.get("channelCatId") or not chosen.get("catName"):
+            continue
+        labels.append({
+            "channelCateName": chosen["catName"], "channelCateId": chosen["channelCatId"],
+            "tbCatId": chosen.get("tbCatId"), "labelType": "common", "propertyName": d.get("propertyName"),
+            "propertyId": d.get("propertyId"), "isUserClick": "1", "from": "newPublishChoice",
+            "labelFrom": "newPublish", "text": chosen["catName"],
+            "properties": f"{d.get('propertyId')}##{d.get('propertyName')}:{chosen['channelCatId']}##{chosen['catName']}",
+            "valueId": None, "valueName": None, "subPropertyId": None, "subValueId": None, "labelId": None,
+            "isUserCancel": None,
+        })
+    return labels
+
+
+def _image_info(image):
+    return {"extraInfo": {"isH": "false", "isT": "false", "raw": "false"}, "isQrCode": False,
+            "url": image["url"], "heightSize": image["height"], "widthSize": image["width"],
+            "major": True, "type": 0, "status": "done"}
+
+
+def _address():
+    data = client().call("mtop.taobao.idle.local.poi.get", {"longitude": 116.40, "latitude": 39.90},
+                         spm_cnt="a21ybx.publish.0.0")
+    addresses = data.get("commonAddresses") or []
+    if not addresses:
+        raise XianyuError("闲鱼账号没有常用地址，请先在闲鱼 App 里手动发布一次商品设置发货地址")
+    return addresses[0]
+
+
+def _find_item_id(node):
+    if isinstance(node, dict):
+        for key in ("itemId", "idleItemId", "item_id"):
+            value = str(node.get(key) or "")
+            if value.isdigit() and len(value) >= 6:
+                return value
+        node = list(node.values())
+    if isinstance(node, list):
+        for value in node:
+            found = _find_item_id(value)
+            if found:
+                return found
+    return None
+
+
+def publish_listing(listing):
+    images = []
+    for filename in json.loads(listing["images"]):
+        with open(image_path(filename), "rb") as f:
+            images.append(client().upload_image(f.read(), filename))
+        time.sleep(random.uniform(1, 2.5))
+    category, cards = _category(listing["title"], listing["description"], images, listing["category_hint"])
+    time.sleep(random.uniform(1, 2))
+    addr = _address()
+
+    post_fee = {"canFreeShipping": False, "supportFreight": False, "onlyTakeSelf": False}
+    delivery = listing["delivery"]
+    if delivery == "包邮":
+        post_fee.update(canFreeShipping=True, supportFreight=True)
+    elif delivery == "按距离计费":
+        post_fee.update(supportFreight=True, templateId="-100")
+    elif delivery == "一口价":
+        post_fee.update(supportFreight=True, templateId="0",
+                        postPriceInCent=str(int(round((listing["post_price"] or 0) * 100))))
+    else:
+        post_fee["templateId"] = "0"
+
+    price = {"priceInCent": str(int(round(listing["price"] * 100)))}
+    if listing["orig_price"]:
+        price["origPriceInCent"] = str(int(round(listing["orig_price"] * 100)))
+
+    payload = {
+        "freebies": False, "itemTypeStr": "b", "quantity": "1", "simpleItem": "true",
+        "imageInfoDOList": [_image_info(i) for i in images],
+        "itemTextDTO": {"desc": listing["description"], "title": listing["title"],
+                        "titleDescSeparate": listing["description"] != listing["title"]},
+        "itemLabelExtList": _labels(cards),
+        "itemPriceDTO": price, "defaultPrice": False,
+        "userRightsProtocols": [{"enable": False, "serviceCode": "SKILL_PLAY_NO_MIND"}],
+        "itemPostFeeDTO": post_fee,
+        "itemAddrDTO": {
+            "area": addr.get("area", ""), "city": addr.get("city", ""), "divisionId": addr.get("divisionId", 0),
+            "gps": f"{addr.get('longitude')},{addr.get('latitude')}", "poiId": addr.get("poiId", ""),
+            "poiName": addr.get("poi", ""), "prov": addr.get("prov", ""),
+        },
+        "itemCatDTO": category,
+        "uniqueCode": str(int(time.time() * 1e6)),
+        "sourceId": "pcMainPublish", "bizcode": "pcMainPublish", "publishScene": "pcMainPublish",
+    }
+    time.sleep(random.uniform(2, 5))  # 模拟人填完表单再点发布
+    data = client().call("mtop.idle.pc.idleitem.publish", payload, spm_cnt="a21ybx.publish.0.0")
+    return _find_item_id(data) or ""
+
+
+def run_publish(listing_id):
+    listing = store.row("SELECT * FROM listings WHERE id = ?", (int(listing_id),))
+    store.execute("UPDATE listings SET status = 'publishing', error = '' WHERE id = ?", (listing["id"],))
+    _task_state["progress"] = f"正在上架：{listing['title'][:20]}"
+    try:
+        item_id = publish_listing(listing)
+        store.execute("UPDATE listings SET status = 'published', item_id = ?, published_at = ? WHERE id = ?",
+                      (item_id, time.time(), listing["id"]))
+        store.log_event("publish", "", f"已上架「{listing['title']}」{item_id}")
+        notify.notify("delivery", "自动上架成功", f"「{listing['title']}」已上架 {item_id}")
+        _task_state["progress"] = f"上架成功：{listing['title'][:20]}"
+    except RiskControlError as e:
+        # 风控：放回队列，熔断结束后再试
+        store.execute("UPDATE listings SET status = 'queued', error = ? WHERE id = ?", (str(e), listing["id"]))
+        raise
+    except Exception as e:
+        store.execute("UPDATE listings SET status = 'failed', error = ? WHERE id = ?", (str(e)[:300], listing["id"]))
+        _task_state["progress"] = f"上架失败：{e}"
+        logger.error(f"上架「{listing['title']}」失败：{e}")
+
+
+# ---------------- AI 写文案 ----------------
+
+def ai_write(brief):
+    brief = str(brief or "").strip()
+    if not brief:
+        raise ValueError("先简单描述一下你要卖的东西，比如：九成新 iPad Air 5 64G 蓝色，带原装充电器")
+    from .llm import RoutedClient
+
+    fallback = None
+    from .server import env_values
+    key = (env_values().get("API_KEY") or "").strip()
+    if key and "百炼" not in key:
+        from openai import OpenAI
+        fallback = OpenAI(api_key=key, base_url=env_values().get("MODEL_BASE_URL") or None)
+    try:
+        resp = _ai_complete(RoutedClient(fallback), brief)
+    except RuntimeError as e:
+        raise ValueError(str(e))
+    text = (resp.choices[0].message.content or "").strip()
+    match = re.search(r"\{.*\}", text, re.S)
+    try:
+        data = json.loads(match.group(0) if match else text)
+    except ValueError:
+        raise ValueError("AI 返回的格式不对，请再试一次")
+    return {k: str(data.get(k, "")).strip() for k in ("title", "description", "category_hint")}
+
+
+def _ai_complete(llm, brief):
+    return llm.chat.completions.create(
+        model="", temperature=0.7, max_tokens=800,
+        messages=[
+            {"role": "system", "content": (
+                "你是闲鱼资深卖家，擅长写真实、口语化、有吸引力的二手商品文案。"
+                "根据卖家给的信息写标题和描述，不要编造卖家没提到的参数和瑕疵情况，不要出现微信、QQ 等站外联系方式。"
+                "标题 15-30 个字，突出品牌型号、成色和卖点；描述 80-200 字，分几行写：成色、配件、购买渠道/时间、出售原因、交易说明。"
+                '只输出 JSON：{"title": "...", "description": "...", "category_hint": "商品类目，如 平板电脑"}')},
+            {"role": "user", "content": brief},
+        ],
+    )
+
+
+# ---------------- 调度 ----------------
+
+class Scheduler:
+    """每 30 秒检查一次：到点自动擦亮、按队列逐个上架"""
+
+    def __init__(self):
+        self._polish_at = {}  # 日期 -> 今天随机选定的擦亮时间
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                self.tick()
+            except Exception as e:
+                logger.warning(f"调度任务出错：{e}")
+            time.sleep(30)
+
+    def tick(self):
+        if safety.is_paused() or safety.in_quiet_hours() or _task_state["running"]:
+            return
+        from .server import read_cookie
+        if not read_cookie():
+            return
+        self._check_polish()
+        if not _task_state["running"]:
+            self._check_publish()
+
+    def _check_polish(self):
+        s = store.get_settings()
+        conf = s["auto_polish"]
+        today = time.strftime("%Y-%m-%d")
+        if not conf.get("enabled") or s.get("polish_last_date") == today:
+            return
+        if today not in self._polish_at:
+            # 在窗口内随机选一个时间，每天不一样
+            start_h, start_m = map(int, conf["window_start"].split(":"))
+            end_h, end_m = map(int, conf["window_end"].split(":"))
+            start, end = start_h * 60 + start_m, end_h * 60 + end_m
+            minute = random.randint(start, max(start, end - 1))
+            self._polish_at = {today: f"{minute // 60:02d}:{minute % 60:02d}"}
+            logger.info(f"今天的自动擦亮时间：{self._polish_at[today]}")
+        if time.strftime("%H:%M") >= self._polish_at[today]:
+            store.save_settings({"polish_last_date": today})
+            _run_task("自动擦亮", polish_all)
+
+    def _check_publish(self):
+        due = store.row("SELECT id FROM listings WHERE status = 'queued' AND scheduled_at <= ? "
+                        "ORDER BY scheduled_at, id LIMIT 1", (time.time(),))
+        if not due or safety.publish_block_reason():
+            return
+        _run_task("自动上架", lambda: run_publish(due["id"]))
+
+    def next_polish_time(self):
+        return self._polish_at.get(time.strftime("%Y-%m-%d"))
+
+
+scheduler = Scheduler()

@@ -95,6 +95,33 @@ CREATE TABLE IF NOT EXISTS events (
     created_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_events_time ON events (created_at);
+CREATE TABLE IF NOT EXISTS my_items (
+    item_id TEXT PRIMARY KEY,
+    title TEXT DEFAULT '',
+    price TEXT DEFAULT '',
+    pic_url TEXT DEFAULT '',
+    status TEXT DEFAULT '',
+    synced_at REAL,
+    last_polished_at REAL,
+    last_polish_result TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS listings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    price REAL,
+    orig_price REAL,
+    delivery TEXT DEFAULT '包邮',
+    post_price REAL,
+    category_hint TEXT DEFAULT '',
+    images TEXT DEFAULT '[]',
+    status TEXT DEFAULT 'draft',
+    scheduled_at REAL,
+    item_id TEXT DEFAULT '',
+    error TEXT DEFAULT '',
+    created_at REAL,
+    published_at REAL
+);
 CREATE TABLE IF NOT EXISTS notify_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -127,6 +154,14 @@ DEFAULT_SETTINGS = {
     "auto_start_bot": False,
     # 机器人意外退出后自动重启
     "auto_restart": True,
+    # 防风控模式：standard / steady / cautious
+    "safety_level": "steady",
+    # 防风控熔断（程序内部维护）
+    "safety_pause_until": 0,
+    "safety_pause_reason": "",
+    # 自动擦亮：每天在时间窗口内随机挑一个时间执行
+    "auto_polish": {"enabled": False, "window_start": "08:00", "window_end": "10:00"},
+    "polish_last_date": "",
 }
 
 _schema_lock = threading.Lock()
@@ -221,6 +256,8 @@ EVENT_TYPES = {
     "order": "买家付款",
     "delivery": "自动发货",
     "risk": "风控/登录异常",
+    "publish": "自动上架",
+    "polish": "擦亮",
 }
 
 

@@ -350,3 +350,14 @@ td.actions .btn { margin-left: 6px; }
   .provider { flex-wrap: wrap; }
   .provider .ops { width: 100%; }
 }
+
+/* ---------- 防风控模式 ---------- */
+.road.level { cursor: pointer; transition: border-color .15s, background .15s; }
+.road.level:hover { border-color: #4a5566; }
+.road.level.selected { border-color: rgba(255, 197, 61, .6); background: var(--accent-soft); }
+th.hl, td.hl { background: rgba(255, 197, 61, .06); color: var(--text); }
+input[type=radio] { accent-color: var(--accent); }
+input[type=datetime-local] {
+  width: 100%; font: inherit; color: var(--text); background: #0e1218;
+  border: 1px solid var(--border-strong); border-radius: 9px; padding: 8px 11px; color-scheme: dark;
+}
