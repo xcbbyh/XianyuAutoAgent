@@ -141,6 +141,7 @@ const ICON_PATHS = {
   delivery: "M3 7l9-4 9 4-9 4-9-4zm0 0v10l9 4 9-4V7M12 11v10",
   items: "M20 7H4v13h16V7zM16 7V4H8v3M4 12h16",
   listings: "M12 5v14M5 12h14M4 4h16v16H4z",
+  screenshots: "M4 8h3l2-3h6l2 3h3v11H4zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",
   safety: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3zm-3 9l2 2 4-4",
   chats: "M4 5h16v11H8l-4 4V5z",
   logs: "M5 4h14v16H5zM8 8h8M8 12h8M8 16h5",
@@ -156,7 +157,7 @@ const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColo
 const NAV = [
   ["总览", [["overview", "仪表盘"]]],
   ["客服中心", [["reply", "AI 自动回复"], ["keywords", "关键词回复"], ["prompts", "话术提示词"], ["blacklist", "黑名单"]]],
-  ["商品与交易", [["items", "商品管理"], ["listings", "自动上架"], ["delivery", "自动发货"]]],
+  ["商品与交易", [["items", "商品管理"], ["listings", "自动上架"], ["screenshots", "网页截图"], ["delivery", "自动发货"]]],
   ["数据中心", [["chats", "对话记录"], ["logs", "运行日志"]]],
   ["接入配置", [["models", "AI 模型"], ["account", "闲鱼账号"], ["notify", "消息通知"]]],
   ["安全中心", [["safety", "防风控模式"]]],
@@ -171,6 +172,7 @@ const PAGE_SUB = {
   delivery: "买家付款后自动发送虚拟商品内容或卡密",
   items: "在售商品同步与自动擦亮",
   listings: "写好商品排队自动发布，AI 帮写文案",
+  screenshots: "在浏览器里登录自己的网站，自动截图并按日期存好",
   safety: "限速、静默、熔断，让自动化更像真人",
   chats: "每位买家的完整对话",
   logs: "机器人实时输出",
@@ -802,6 +804,114 @@ function pollTask() {
 
 /* ---------------- 自动上架 ---------------- */
 
+/* AI 上架助手：像聊天一样说要卖什么，AI 整理成商品草稿，确认后加入上架队列 */
+
+const AI_SHOP_HELLO = "你好！告诉我你想卖什么，比如「九成新 iPad Air 5 64G 蓝色，带充电器，想卖 2000」。我会帮你写好标题和描述，你确认后再上架。";
+
+function aiShopState() {
+  if (!state.aiShop) state.aiShop = { messages: [], draft: { delivery: "包邮" }, images: [], busy: false };
+  return state.aiShop;
+}
+
+function aiShopHtml() {
+  return `
+    <div class="card ai-shop">
+      <div class="card-head"><h3>✨ AI 上架助手</h3><span class="desc">像聊天一样说你要卖什么，AI 写好标题、描述和价格；你点「确认上架」后才会发布</span>
+        <div class="actions"><button class="btn sm" id="aiReset">重新开始</button></div></div>
+      <div class="ai-shop-body">
+        <div class="ai-chat">
+          <div class="ai-msgs" id="aiMsgs"></div>
+          <form class="ai-input" id="aiForm">
+            <textarea id="aiText" rows="2" placeholder="说说你要卖什么，或者让 AI 修改，比如「价格改成 1800」「标题加上国行」…（Enter 发送，Shift+Enter 换行）"></textarea>
+            <button class="btn primary" type="submit" id="aiSend">发送</button>
+          </form>
+        </div>
+        <div class="ai-draft" id="aiDraft"></div>
+      </div>
+    </div>`;
+}
+
+function bindAiShop(el, choices) {
+  const s = aiShopState();
+  const renderMsgs = () => {
+    const box = $("#aiMsgs", el);
+    box.innerHTML = [{ role: "assistant", content: AI_SHOP_HELLO }, ...s.messages].map((m) =>
+      `<div class="ai-msg ${m.role === "user" ? "me" : "ai"}">${esc(m.content).replace(/\n/g, "<br>")}</div>`).join("")
+      + (s.busy ? `<div class="ai-msg ai muted">AI 正在写…</div>` : "");
+    box.scrollTop = box.scrollHeight;
+    $("#aiSend", el).disabled = s.busy;
+  };
+  const renderDraft = () => {
+    const d = s.draft;
+    const missing = [!s.images.length && "图片", !d.title && "标题", !d.description && "描述", (d.price == null || d.price === "") && "售价"].filter(Boolean);
+    $("#aiDraft", el).innerHTML = `
+      <div class="section-title" style="margin-top:0">商品图片（第一张是封面）</div>
+      <div class="ai-imgs">${s.images.map((img, i) => `<div class="ai-img"><img src="/uploads/${esc(img)}" alt="">
+          <button type="button" class="btn sm danger" data-airm="${i}">删</button></div>`).join("")}
+        ${s.images.length < 9 ? `<label class="btn ai-add"><span>＋</span><small>上传</small><input type="file" accept="image/*" multiple hidden id="aiImgInput"></label>
+        <button type="button" class="btn ai-add" id="aiFromShots"><span>📷</span><small>从截图选</small></button>` : ""}</div>
+      <div class="ai-fields">
+        <div><span>标题</span><b>${esc(d.title) || `<i class="muted">等 AI 生成</i>`}</b></div>
+        <div><span>售价</span><b>${d.price != null && d.price !== "" ? `¥ ${esc(d.price)}` : `<i class="muted">未定</i>`}</b>
+          ${d.orig_price ? `<span class="muted">原价 ¥ ${esc(d.orig_price)}</span>` : ""}</div>
+        <div><span>运费</span><b>${esc(d.delivery || "包邮")}${d.delivery === "一口价" && d.post_price != null ? ` ¥ ${esc(d.post_price)}` : ""}</b>
+          ${d.category_hint ? `<span class="muted">类目：${esc(d.category_hint)}</span>` : ""}</div>
+        <div><span>描述</span><p>${d.description ? esc(d.description).replace(/\n/g, "<br>") : `<i class="muted">等 AI 生成</i>`}</p></div>
+      </div>
+      ${missing.length ? `<div class="help">还缺：${missing.join("、")}</div>` : `<div class="help">都齐了。确认上架后会按防风控节奏自动发布到你的闲鱼。</div>`}
+      <div class="ai-actions">
+        <button class="btn primary" id="aiPublish" ${missing.length ? "disabled" : ""}>确认上架</button>
+        <button class="btn" id="aiDraftSave" ${missing.length ? "disabled" : ""}>存为草稿</button>
+        <button class="btn" id="aiEdit">手动修改</button>
+      </div>`;
+    $$("[data-airm]", el).forEach((b) => (b.onclick = () => { s.images.splice(Number(b.dataset.airm), 1); renderDraft(); }));
+    $("#aiImgInput", el)?.addEventListener("change", async (e) => {
+      for (const file of [...e.target.files].slice(0, 9 - s.images.length)) {
+        const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+        try { s.images.push(await api("/api/listings/upload", { name: file.name, data })); renderDraft(); }
+        catch (err) { toast(err.message, "error"); }
+      }
+    });
+    $("#aiFromShots", el)?.addEventListener("click", () => pickScreenshots((img) => {
+      if (s.images.length < 9) s.images.push(img);
+      renderDraft();
+    }).catch((err) => toast(err.message, "error")));
+    const save = async (action) => {
+      const r = await api("/api/listings/save", { ...d, images: s.images, action });
+      state.aiShop = null;
+      toast(action === "draft" ? "已存为草稿" : r.block ? `已加入上架队列（${r.block}，会自动顺延）` : "已加入上架队列，稍后自动发布");
+      navigate("listings", true);
+    };
+    $("#aiPublish", el).onclick = () => confirmBox(
+      `确认把「${d.title}」以 ¥${d.price} 上架到闲鱼？会加入上架队列，按防风控节奏自动发布。`,
+      () => save("publish").catch((err) => toast(err.message, "error")), "确认上架");
+    $("#aiDraftSave", el).onclick = () => save("draft").catch((err) => toast(err.message, "error"));
+    $("#aiEdit", el).onclick = () => editListing({ ...d, images: [...s.images] }, choices);
+  };
+  const send = async () => {
+    const text = $("#aiText", el).value.trim();
+    if (!text || s.busy) return;
+    s.messages.push({ role: "user", content: text });
+    $("#aiText", el).value = "";
+    s.busy = true; renderMsgs();
+    try {
+      const r = await api("/api/listings/ai_chat", { messages: s.messages, draft: s.draft, has_images: s.images.length > 0 });
+      s.messages.push({ role: "assistant", content: r.reply });
+      s.draft = r.draft;
+    } catch (err) {
+      s.messages.push({ role: "assistant", content: "⚠ " + err.message });
+    }
+    s.busy = false;
+    if (state.page === "listings") { renderMsgs(); renderDraft(); }
+  };
+  $("#aiForm", el).onsubmit = (e) => { e.preventDefault(); send(); };
+  $("#aiText", el).addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  });
+  $("#aiReset", el).onclick = () => { state.aiShop = null; navigate("listings", true); };
+  renderMsgs(); renderDraft();
+}
+
 const LISTING_BADGE = { draft: "", queued: "info", publishing: "warn", published: "good", failed: "bad" };
 
 PAGES.listings = async (el) => {
@@ -813,6 +923,7 @@ PAGES.listings = async (el) => {
       <span class="muted">排队中的商品由控制台按防风控规则逐个发布：今天已上架 ${sp.today.publish}/${sp.params.publish_daily_limit} 个，两次间隔至少 ${sp.params.publish_interval_minutes} 分钟，夜间 ${sp.params.quiet_start}-${sp.params.quiet_end} 不发布。
       ${sp.publish_block ? `当前暂不能发布：<b style="display:inline">${esc(sp.publish_block)}</b>。` : "当前可以发布。"}
       闲鱼账号需要先在 App 里设置过发货地址。建议先用一个商品试一次。</span></div></div>
+    ${aiShopHtml()}
     <div class="card">
       <div class="card-head"><h3>上架队列</h3><span class="desc">控制台要保持运行，排队的商品才会被发布</span>
         <div class="actions"><button class="btn primary" id="newListing">＋ 新建商品</button></div></div>
@@ -831,6 +942,7 @@ PAGES.listings = async (el) => {
             ${l.status !== "publishing" ? `<button class="btn sm danger" data-del="${l.id}">删除</button>` : ""}</td></tr>`).join("")}
         </tbody></table></div>` : emptyHtml("还没有商品。点「新建商品」，可以让 AI 根据一句话帮你写标题和描述。")}
     </div>`;
+  bindAiShop(el, d.delivery_choices);
   $("#newListing").onclick = () => editListing({}, d.delivery_choices);
   const find = (id) => d.listings.find((l) => l.id == id);
   $$("[data-edit]", el).forEach((b) => (b.onclick = () => editListing(find(b.dataset.edit), d.delivery_choices)));
@@ -904,8 +1016,13 @@ function editListing(l, choices) {
       ${i === 0 ? `<span class="badge accent" style="position:absolute;left:4px;top:4px">封面</span>` : ""}
       <button type="button" class="btn sm danger" data-rmimg="${i}" style="position:absolute;right:4px;bottom:4px;height:22px;padding:0 6px">删</button></div>`).join("")
       + (images.length < 9 ? `<label class="btn" style="width:88px;height:88px;flex-direction:column"><span style="font-size:22px">＋</span><span style="font-size:12px">上传</span>
-        <input type="file" accept="image/*" multiple hidden id="imgInput"></label>` : "");
+        <input type="file" accept="image/*" multiple hidden id="imgInput"></label>
+        <button type="button" class="btn" id="fromShots" style="width:88px;height:88px;flex-direction:column"><span style="font-size:20px">📷</span><span style="font-size:12px">从截图选</span></button>` : "");
     $$("[data-rmimg]", f).forEach((b) => (b.onclick = () => { images.splice(Number(b.dataset.rmimg), 1); renderImgs(); }));
+    $("#fromShots", f)?.addEventListener("click", () => pickScreenshots((img) => {
+      if (images.length < 9) images.push(img);
+      renderImgs();
+    }).catch((err) => toast(err.message, "error")));
     $("#imgInput", f)?.addEventListener("change", async (e) => {
       for (const file of [...e.target.files].slice(0, 9 - images.length)) {
         const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
@@ -934,6 +1051,150 @@ function editListing(l, choices) {
     } catch (err) { toast(err.message, "error"); }
     btn.disabled = false; btn.textContent = "生成";
   };
+}
+
+/* ---------------- 网页截图 ---------------- */
+
+const shotUrl = (date, file) => `/screenshots/${encodeURIComponent(date)}/${encodeURIComponent(file)}`;
+
+function shotResults(task) {
+  if (!task || (!task.running && !task.results.length && !task.progress)) return "";
+  const tone = task.running ? "info" : task.results.every((r) => r.ok && !r.warning) ? "good" : "warn";
+  return `<div class="shot-task ${tone}">
+    <b>${task.running ? "⏳ " : ""}${esc(task.progress)}</b>
+    ${task.results.map((r) => `<div class="${r.ok ? (r.warning ? "warn" : "good") : "bad"}">${r.ok ? "✓" : "✗"} ${esc(r.name)}
+      ${r.ok ? `— 已保存 <span class="mono">${esc(r.file)}</span>` : `— ${esc(r.error)}`}
+      ${r.warning ? ` ⚠ ${esc(r.warning)}` : ""} <span class="muted">(${r.seconds} 秒)</span></div>`).join("")}
+  </div>`;
+}
+
+PAGES.screenshots = async (el) => {
+  const d = await api("/api/screenshots");
+  let pages = d.pages.map((p) => ({ ...p }));
+  const open = d.browser.open;
+  el.innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>第一步：在浏览器里登录你的网站</h3>
+        <span class="desc">${open ? `<span class="badge good">浏览器已打开</span>` : `<span class="badge">浏览器未打开</span>`}</span></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input type="text" id="loginUrl" value="${esc(d.login_url)}" placeholder="你平台的网址，例如 https://www.example.com/" style="flex:1;min-width:240px">
+        <button class="btn primary" id="openLogin">打开浏览器登录</button>
+        ${open ? `<button class="btn" id="closeBrowser">关闭浏览器</button>` : ""}
+      </div>
+      <div class="help">会在你电脑上打开一个单独的浏览器窗口（优先用 Edge）。在里面<b>自己手动登录一次</b>，账号密码只在那个窗口里输入，控制台看不到。
+        登录状态保存在 <span class="mono">data/browser_profile</span>，下次不用再登录；登录过期了再点一次这个按钮重新登录即可。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>第二步：要截图的页面</h3><span class="desc">点「全部截图」会依次打开每个网址并截图</span>
+        <div class="actions"><button class="btn" id="addPage">＋ 添加页面</button><button class="btn" id="savePages">保存列表</button>
+          <button class="btn primary" id="captureAll">全部截图</button></div></div>
+      <div id="shotTask">${shotResults(d.browser.task)}</div>
+      <div id="pageRows"></div>
+      <div class="help">「整页」会把整个网页从上到下截成一张长图；「等待」是打开网页后再等几秒再截（网页加载慢时调大）；
+        「只截区域」可以留空，懂网页的话可以填 CSS 选择器只截某一块。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>截图文件</h3><span class="desc">按日期分文件夹保存在 <span class="mono">${esc(d.folder)}</span></span>
+        <div class="actions"><button class="btn" id="openFolder">打开文件夹</button></div></div>
+      ${d.days.length ? d.days.map((day) => `
+        <div class="section-title">${esc(day.date)}（${day.files.length} 张）</div>
+        <div class="shot-grid">${day.files.map((f) => `
+          <div class="shot"><a href="${shotUrl(day.date, f)}" target="_blank" rel="noopener"><img src="${shotUrl(day.date, f)}" alt="" loading="lazy"></a>
+            <div class="shot-name mono" title="${esc(f)}">${esc(f)}</div>
+            <button class="btn sm danger" data-delshot="${esc(day.date)}|${esc(f)}">删除</button></div>`).join("")}</div>`).join("")
+        : emptyHtml("还没有截图。先登录，再添加页面并点「全部截图」。")}
+    </div>`;
+
+  const renderRows = () => {
+    $("#pageRows").innerHTML = pages.length ? `<div class="table-wrap"><table><thead><tr><th>名称</th><th>网址</th><th>整页</th><th>等待(秒)</th><th>只截区域</th><th></th></tr></thead>
+      <tbody>${pages.map((p, i) => `<tr data-row="${i}">
+        <td><input type="text" data-k="name" value="${esc(p.name)}" placeholder="例如 首页" style="width:110px"></td>
+        <td><input type="text" data-k="url" value="${esc(p.url)}" placeholder="https://..." style="min-width:220px;width:100%"></td>
+        <td><input type="checkbox" data-k="full_page" ${p.full_page ? "checked" : ""}></td>
+        <td><input type="number" data-k="wait" min="0" max="60" step="0.5" value="${esc(p.wait ?? 2)}" style="width:70px"></td>
+        <td><input type="text" data-k="selector" value="${esc(p.selector || "")}" placeholder="可留空" style="width:110px"></td>
+        <td class="actions nowrap"><button class="btn sm" data-one="${i}">截这张</button><button class="btn sm danger" data-rm="${i}">删</button></td>
+      </tr>`).join("")}</tbody></table></div>` : emptyHtml("还没有页面，点右上角「添加页面」");
+    $$("[data-row] input").forEach((inp) => (inp.oninput = inp.onchange = () => {
+      const p = pages[inp.closest("[data-row]").dataset.row];
+      p[inp.dataset.k] = inp.type === "checkbox" ? inp.checked : inp.value;
+      state.dirty = true;
+    }));
+    $$("[data-rm]").forEach((b) => (b.onclick = () => { pages.splice(Number(b.dataset.rm), 1); state.dirty = true; renderRows(); }));
+    $$("[data-one]").forEach((b) => (b.onclick = () => capture([pages[b.dataset.one].name])));
+    $("#captureAll").disabled = !pages.length;
+  };
+  renderRows();
+
+  const saveConfig = async () => {
+    const r = await api("/api/screenshots/config", { login_url: $("#loginUrl").value, pages });
+    pages = r.pages.map((p) => ({ ...p }));
+    state.dirty = false;
+    return r;
+  };
+  const poll = () => {
+    clearInterval(state.pagePoll);
+    state.pagePoll = setInterval(async () => {
+      const s = await api("/api/screenshots/status").catch(() => null);
+      if (!s || state.page !== "screenshots") return clearInterval(state.pagePoll);
+      $("#shotTask").innerHTML = shotResults(s.task);
+      if (!s.task.running) { clearInterval(state.pagePoll); navigate("screenshots", true); }
+    }, 1500);
+  };
+  const capture = async (names) => {
+    try {
+      await saveConfig();
+      const t = await api("/api/screenshots/capture", { names });
+      $("#shotTask").innerHTML = shotResults(t);
+      poll();
+    } catch (e) { toast(e.message, "error"); }
+  };
+
+  $("#addPage").onclick = () => {
+    const base = $("#loginUrl").value.trim();
+    pages.push({ name: `页面${pages.length + 1}`, url: pages.length ? "" : base, full_page: false, wait: 2, selector: "" });
+    state.dirty = true; renderRows();
+  };
+  $("#savePages").onclick = () => run(saveConfig, "页面列表已保存").then(() => navigate("screenshots", true));
+  $("#captureAll").onclick = () => capture(null);
+  $("#openLogin").onclick = async (e) => {
+    const btn = e.target; btn.disabled = true; btn.textContent = "正在打开…";
+    try {
+      await saveConfig();
+      const r = await api("/api/screenshots/open", { url: $("#loginUrl").value });
+      toast(`已打开浏览器（${r.channel}），请在弹出的窗口里登录`);
+    } catch (err) { toast(err.message, "error"); }
+    navigate("screenshots", true);
+  };
+  $("#closeBrowser") && ($("#closeBrowser").onclick = async () => { await run(() => api("/api/screenshots/close", {}), "浏览器已关闭"); navigate("screenshots", true); });
+  $("#openFolder").onclick = () => run(() => api("/api/screenshots/folder", {}), "已在电脑上打开截图文件夹");
+  $$("[data-delshot]").forEach((b) => (b.onclick = async () => {
+    if (!window.confirm("确定删除这张截图吗？")) return;
+    const [date, file] = b.dataset.delshot.split("|");
+    await run(() => api("/api/screenshots/delete", { date, file }), "已删除");
+    navigate("screenshots", true);
+  }));
+  if (d.browser.task.running) poll();
+};
+
+async function pickScreenshots(onPick) {
+  const d = await api("/api/screenshots");
+  const files = d.days.flatMap((day) => day.files.map((f) => ({ date: day.date, file: f }))).slice(0, 60);
+  const m = modal({
+    title: "从网页截图里选图片", wide: true, submitText: "添加选中的图片",
+    body: files.length ? `<div class="help" style="margin:0 0 12px">点图片选中（可多选），第一张选中的会排在前面。</div>
+      <div class="shot-grid pick">${files.map((f, i) => `<label class="shot"><input type="checkbox" value="${i}" hidden>
+        <img src="${shotUrl(f.date, f.file)}" alt="" loading="lazy"><div class="shot-name mono">${esc(f.date)} ${esc(f.file)}</div></label>`).join("")}</div>`
+      : emptyHtml("还没有截图，请先到「网页截图」页面截图"),
+    onSubmit: async (_, form) => {
+      const chosen = [...form.querySelectorAll("input:checked")].map((c) => files[c.value]);
+      if (!chosen.length) throw new Error("请先点选图片");
+      for (const f of chosen) await onPick(await api("/api/listings/from_screenshot", f));
+    },
+  });
+  return m;
 }
 
 /* ---------------- 对话记录 ---------------- */
@@ -1027,9 +1288,18 @@ PAGES.models = async (el) => {
   const { providers, categories } = await api("/api/providers");
   let filter = state.modelFilter || "all";
   const order = providers.filter((p) => p.enabled && p.key_count);
+  // 已启用但最近一次测试失败的模型，在页面顶部明确提示
+  const failing = order.filter((p) => p.last_test && (p.last_test.keys ? p.last_test.ok_count < p.last_test.total : !p.last_test.ok));
+  const failHtml = failing.length ? `<div class="banner bad"><div class="grow"><b>有模型测试没通过，机器人调用时可能失败</b>
+    ${failing.map((p) => {
+      const t = p.last_test;
+      const bad = t.keys ? t.keys.filter((k) => !k.ok) : [];
+      const why = bad.length ? [...new Set(bad.map((k) => `${k.code ? k.code + " " : ""}${k.hint}`))].join("；") : t.error;
+      return `<span style="display:block">${esc(p.name)}：${t.keys ? `${t.total - t.ok_count}/${t.total} 把 Key 不可用，` : ""}${esc(why)}</span>`;
+    }).join("")}</div></div>` : "";
   const render = () => {
     const list = providers.filter((p) => filter === "all" || (filter === "enabled" ? p.enabled : p.category === filter));
-    el.innerHTML = `
+    el.innerHTML = `${failHtml}
       <div class="banner ${order.length ? "info" : "warn"}"><div class="grow">
         ${order.length ? `<b>当前调用顺序（失败自动切换到下一个）</b><span>${order.map((p, i) => `${i + 1}. ${esc(p.name)}${p.key_count > 1 ? `（${p.key_count} 个 Key 轮换）` : ""}`).join(" → ")}</span>`
           : `<b>还没有可用的 AI 模型</b><span class="muted">选一个平台点「配置」，填入 API Key 并启用。推荐国内用户用通义千问或 DeepSeek。</span>`}
@@ -1053,10 +1323,11 @@ PAGES.models = async (el) => {
       await run(() => api("/api/providers/default", { id: b.dataset.default }), "已设为默认模型"); navigate("models", true);
     }));
     $$("[data-test]", el).forEach((b) => (b.onclick = async () => {
-      b.disabled = true; b.textContent = "测试中…";
+      const p = providers.find((x) => x.id === b.dataset.test);
+      b.disabled = true; b.textContent = `测试中…（${p.key_count} 把 Key）`;
       try {
-        const r = await api("/api/providers/test", { id: b.dataset.test });
-        r.ok ? toast(`连接成功（${r.latency} 秒）：${r.reply}`) : toast("连接失败：" + r.error, "error");
+        const r = await api("/api/providers/test", { id: p.id });
+        r.ok ? toast(`${r.ok_count}/${r.total} 把 Key 可用`) : toast("全部 Key 都不可用：" + r.error, "error");
       } catch (e) { toast(e.message, "error"); }
       navigate("models", true);
     }));
@@ -1066,7 +1337,13 @@ PAGES.models = async (el) => {
 
 function providerCard(p) {
   const t = p.last_test;
-  const testBadge = t ? (t.ok ? `<span class="badge good">测试通过 ${t.latency}s</span>` : `<span class="badge bad" title="${esc(t.error)}">测试失败</span>`) : "";
+  const testBadge = !t ? "" : t.keys
+    ? `<span class="badge ${t.ok_count === t.total ? "good" : t.ok ? "warn" : "bad"}">测试 ${t.ok_count}/${t.total} 可用</span>`
+    : (t.ok ? `<span class="badge good">测试通过 ${t.latency}s</span>` : `<span class="badge bad" title="${esc(t.error)}">测试失败</span>`);
+  // 测试结果只对当时的 Key 有效：Key 数量变了就提示重新测试
+  const keyTest = t && t.keys && t.total === p.key_count ? t.keys : null;
+  const keyChips = keyTest ? `<span class="key-chips">${keyTest.map((k) =>
+    `<span class="kc ${k.ok ? "good" : "bad"}" title="${esc(k.ok ? "可用" : `${k.code || ""} ${k.hint}`)}">${k.index}</span>`).join("")}</span>` : "";
   return `
     <div class="provider ${p.enabled ? "on" : "off"}">
       <div class="pic">${esc(p.name.slice(0, 1))}</div>
@@ -1077,7 +1354,7 @@ function providerCard(p) {
           <span class="badge">${esc(p.category_label)}</span>${testBadge}</div>
         <div class="desc">${esc(p.description)}</div>
         <div class="meta"><span>模型：<span class="mono">${esc(p.model)}</span></span>
-          <span>API Key：${p.key_count ? `<span class="ok">✓ 已配置 ${p.key_count} 个</span>` : `<span class="no">✗ 未配置</span>`}</span>
+          <span>API Key：${p.key_count ? `<span class="ok">✓ 已配置 ${p.key_count} 个</span>` : `<span class="no">✗ 未配置</span>`}</span>${keyChips}
           ${p.supports_search ? `<span class="badge info">联网搜索</span>` : ""}<span class="muted">优先级 ${p.priority}</span></div>
       </div>
       <div class="ops">
@@ -1086,7 +1363,24 @@ function providerCard(p) {
         ${p.enabled && !p.is_default ? `<button class="btn sm" data-default="${p.id}">设为默认</button>` : ""}
         <button class="btn sm ${p.enabled ? "danger" : "teal"}" data-toggle="${p.id}">${p.enabled ? "停用" : "启用"}</button>
       </div>
+      ${t && t.keys ? keyTestPanel(t, p) : ""}
     </div>`;
+}
+
+function keyTestPanel(t, p) {
+  const tone = t.ok_count === t.total ? "good" : t.ok ? "warn" : "bad";
+  const when = new Date(t.time * 1000).toLocaleString("zh-CN", { hour12: false });
+  const stale = t.total !== p.key_count ? `<span class="muted">（Key 有变动，请重新测试）</span>` : "";
+  const rows = t.keys.map((k) => `
+    <div class="kt-row ${k.ok ? "good" : "bad"}"><span>${k.index} 号 <span class="mono">${esc(k.key)}</span> <span class="muted">(${k.length}位)</span> —</span>
+      ${k.ok ? `<b>✓ 可用</b> <span>(${k.ms}ms)</span>`
+        : `<b>✗ ${k.code ? k.code + " " : ""}${esc(k.hint)}</b> <span>(${k.ms}ms)</span> <span class="muted kt-err" title="${esc(k.error)}">${esc(k.error)}</span>`}
+    </div>`).join("");
+  const sample = t.reply ? `<div class="kt-reply muted">模型回复：${esc(t.reply)}</div>` : "";
+  return `<div class="key-test ${tone}">
+    <div class="kt-head">${t.ok_count}/${t.total} 把 Key 可用 · 模型 <span class="mono">${esc(t.model || p.model)}</span> <span class="muted">· 测于 ${when}</span>${stale}</div>
+    ${rows}${sample}
+  </div>`;
 }
 
 function configProvider(p) {
@@ -1147,7 +1441,16 @@ PAGES.account = async (el) => {
       <div class="help" style="margin-top:12px">Cookie 会过期；机器人运行时会自动续期，失效或触发风控时会在顶部提醒你，并推送到已配置的通知渠道。</div>
     </div>
     <div class="card">
-      <div class="card-head"><h3>更新 Cookie</h3></div>
+      <div class="card-head"><h3>用浏览器登录，自动读取 Cookie（推荐）</h3></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="xyLogin">① 打开闲鱼登录</button>
+        <button class="btn primary" id="xyCookie">② 已登录，读取 Cookie</button>
+      </div>
+      <div class="help">点①会打开一个单独的浏览器窗口，在里面登录闲鱼（扫码或密码都行）；登录成功后回到这里点②，Cookie 会自动填好，不用按 F12 复制。
+        之后可以直接关掉那个浏览器窗口，<b>不要点退出登录</b>。</div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>更新 Cookie（手动粘贴）</h3></div>
       <form id="cookieForm">
         <label class="field"><span>粘贴完整 Cookie</span><textarea name="cookie" rows="5" class="mono" placeholder="cookie2=...; unb=...; ..." required></textarea></label>
         <button class="btn primary" type="submit">保存 Cookie</button>
@@ -1163,6 +1466,21 @@ PAGES.account = async (el) => {
         <li>粘贴到上面保存。之后直接关掉网页即可，<b>不要点退出登录</b>，否则 Cookie 会立即失效</li>
       </ol>
     </div>`;
+  $("#xyLogin").onclick = async (e) => {
+    const btn = e.target; btn.disabled = true; btn.textContent = "正在打开…";
+    try {
+      await api("/api/screenshots/xianyu_login", {});
+      toast("已打开浏览器，请在弹出的窗口里登录闲鱼");
+    } catch (err) { toast(err.message, "error"); }
+    btn.disabled = false; btn.textContent = "① 打开闲鱼登录";
+  };
+  $("#xyCookie").onclick = async () => {
+    try {
+      await api("/api/screenshots/xianyu_cookie", {});
+      toast("Cookie 已读取并保存，点右上角「重启」生效");
+      navigate("account", true);
+    } catch (err) { toast(err.message, "error"); }
+  };
   $("#cookieForm").onsubmit = async (e) => {
     e.preventDefault();
     await run(() => api("/api/account/cookie", formData(e.target)), "Cookie 已保存");
