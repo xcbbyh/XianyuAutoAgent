@@ -44,14 +44,20 @@ class XianyuClient:
     def __init__(self, cookie_loader):
         self._cookie_loader = cookie_loader
         self._fresh = {}
+        self._base = None
         self._lock = threading.Lock()
         self.session = requests.Session()
 
     def cookies(self):
-        cookies = _parse_cookie(self._cookie_loader())
+        raw = self._cookie_loader()
+        cookies = _parse_cookie(raw)
         if not cookies.get("unb"):
             raise XianyuError("还没有填写有效的闲鱼 Cookie")
         with self._lock:
+            # 用户换了 Cookie（重新登录或换账号）时，丢弃之前接口返回的旧 token
+            if raw != self._base:
+                self._base = raw
+                self._fresh = {}
             cookies.update(self._fresh)
         return cookies
 
@@ -72,8 +78,9 @@ class XianyuClient:
 
     def _remember(self, response):
         with self._lock:
+            # 只记住签名用的 token，其他登录态 Cookie 以 .env 为准
             for key, value in response.cookies.items():
-                if value:
+                if value and key.startswith("_m_h5_tk"):
                     self._fresh[key] = value
 
     def call(self, api, data, version="1.0", spm_cnt="a21ybx.im.0.0", retries=2):

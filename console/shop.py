@@ -195,6 +195,14 @@ def image_path(filename):
     return os.path.join(UPLOAD_DIR, filename)
 
 
+def recover_interrupted():
+    """控制台在上架过程中被关闭：不确定是否已发出，标记为失败让用户到闲鱼确认"""
+    store.execute(
+        "UPDATE listings SET status = 'failed', error = '上架过程中控制台被关闭，请先到闲鱼确认是否已经上架，再决定是否重新加入队列' "
+        "WHERE status = 'publishing'"
+    )
+
+
 def list_listings():
     result = []
     for r in store.rows("SELECT * FROM listings ORDER BY id DESC"):
@@ -221,7 +229,10 @@ def _num(value, name, required=False):
 def save_listing(payload):
     title = str(payload.get("title", "")).strip()
     description = str(payload.get("description", "")).strip()
-    images = [i for i in payload.get("images", []) if i]
+    images = payload.get("images") or []
+    if not isinstance(images, list) or not all(isinstance(i, str) for i in images):
+        raise ValueError("图片参数不正确")
+    images = [i for i in images if i]
     delivery = payload.get("delivery", "包邮")
     if not title:
         raise ValueError("请填写商品标题")
@@ -281,6 +292,15 @@ def delete_listing(listing_id):
     if r["status"] == "publishing":
         raise ValueError("正在发布中，稍后再删")
     store.execute("DELETE FROM listings WHERE id = ?", (int(listing_id),))
+    in_use = set()
+    for other in store.rows("SELECT images FROM listings"):
+        in_use.update(json.loads(other["images"] or "[]"))
+    for filename in json.loads(r["images"] or "[]"):
+        if filename not in in_use:
+            try:
+                os.remove(image_path(filename))
+            except (OSError, ValueError):
+                pass
 
 
 def _category(title, description, images, hint):
@@ -401,7 +421,11 @@ def publish_listing(listing):
 
 def run_publish(listing_id):
     listing = store.row("SELECT * FROM listings WHERE id = ?", (int(listing_id),))
+    if not listing or listing["status"] != "queued":
+        return
     store.execute("UPDATE listings SET status = 'publishing', error = '' WHERE id = ?", (listing["id"],))
+    # 失败的尝试同样算一次操作，防止连续失败时频繁请求闲鱼
+    store.log_event("publish_attempt", "", listing["title"])
     _task_state["progress"] = f"正在上架：{listing['title'][:20]}"
     try:
         item_id = publish_listing(listing)
@@ -496,17 +520,23 @@ class Scheduler:
         today = time.strftime("%Y-%m-%d")
         if not conf.get("enabled") or s.get("polish_last_date") == today:
             return
-        if today not in self._polish_at:
-            # 在窗口内随机选一个时间，每天不一样
+        key = (today, conf["window_start"], conf["window_end"])
+        if key not in self._polish_at:
+            # 在窗口内随机选一个时间，每天不一样；窗口改了就重新选
             start_h, start_m = map(int, conf["window_start"].split(":"))
             end_h, end_m = map(int, conf["window_end"].split(":"))
             start, end = start_h * 60 + start_m, end_h * 60 + end_m
             minute = random.randint(start, max(start, end - 1))
-            self._polish_at = {today: f"{minute // 60:02d}:{minute % 60:02d}"}
-            logger.info(f"今天的自动擦亮时间：{self._polish_at[today]}")
-        if time.strftime("%H:%M") >= self._polish_at[today]:
+            self._polish_at = {key: f"{minute // 60:02d}:{minute % 60:02d}"}
+            logger.info(f"今天的自动擦亮时间：{self._polish_at[key]}")
+        now = time.strftime("%H:%M")
+        # 过了窗口（比如电脑刚开机）就等明天，不在窗口外擦亮
+        if self._polish_at[key] <= now < conf["window_end"]:
+            try:
+                _run_task("自动擦亮", polish_all)
+            except ValueError:
+                return  # 有别的任务在跑，下一轮再试
             store.save_settings({"polish_last_date": today})
-            _run_task("自动擦亮", polish_all)
 
     def _check_publish(self):
         due = store.row("SELECT id FROM listings WHERE status = 'queued' AND scheduled_at <= ? "
@@ -516,7 +546,8 @@ class Scheduler:
         _run_task("自动上架", lambda: run_publish(due["id"]))
 
     def next_polish_time(self):
-        return self._polish_at.get(time.strftime("%Y-%m-%d"))
+        conf = store.get_settings()["auto_polish"]
+        return self._polish_at.get((time.strftime("%Y-%m-%d"), conf["window_start"], conf["window_end"]))
 
 
 scheduler = Scheduler()

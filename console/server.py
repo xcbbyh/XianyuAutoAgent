@@ -15,7 +15,6 @@ import sys
 import threading
 import time
 import webbrowser
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -214,6 +213,9 @@ class BotProcess:
         self.started_at = None
         self.user_stopped = False
         self.restart_times = collections.deque(maxlen=10)
+        # 启动、停止互斥，防止连点或自动重启同时触发时起两个机器人
+        self.control_lock = threading.RLock()
+        self.pump_thread = None
 
     def _append(self, line):
         with self.lock:
@@ -224,6 +226,10 @@ class BotProcess:
         return self.proc is not None and self.proc.poll() is None
 
     def start(self):
+        with self.control_lock:
+            self._start()
+
+    def _start(self):
         if self.running():
             return
         if not read_cookie():
@@ -251,25 +257,17 @@ class BotProcess:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=env, text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
-        threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
+        self.pump_thread = threading.Thread(target=self._pump, args=(self.proc,), daemon=True)
+        self.pump_thread.start()
 
     def _pump(self, proc):
         for line in proc.stdout:
             line = line.rstrip("\r\n")
-            if "连接注册完成" in line:
-                self.online = True
-            elif "WebSocket连接已关闭" in line or "连接发生错误" in line:
-                self.online = False
-            if "触发风控" in line:
-                self.awaiting_cookie = True
-                notify.notify("risk", "触发风控", "闲鱼要求滑块验证，请打开控制台更新 Cookie，否则机器人会停止")
-                safety.trip("机器人连接闲鱼时触发滑块验证")
-            elif "Cookie已更新" in line:
-                self.awaiting_cookie = False
-            if "Cookie已失效" in line:
-                self.cookie_invalid = True
-                store.log_event("risk", "", "Cookie 已失效")
-                notify.notify("risk", "Cookie 已失效", "闲鱼登录已失效，机器人已停止，请在控制台更新 Cookie 后重新启动")
+            try:
+                self._inspect(line)
+            except Exception as e:
+                # 这里出错也要继续读输出，否则管道写满会把机器人卡死
+                self._append(f"[控制台] 处理日志出错：{e}")
             self._append(line)
             if "KeyError: 'unb'" in line:
                 self._append("[控制台] Cookie 不完整（缺少 unb 字段），请确认闲鱼网页版已登录，再重新复制完整 Cookie")
@@ -282,6 +280,23 @@ class BotProcess:
         self.last_exit_code = 0 if self.user_stopped else code
         self._append("[控制台] 机器人已停止" if self.user_stopped else f"[控制台] 机器人已退出（退出码 {code}）")
         self._maybe_restart()
+
+    def _inspect(self, line):
+        """从机器人日志里识别连接状态、风控和 Cookie 失效"""
+        if "连接注册完成" in line:
+            self.online = True
+        elif "WebSocket连接已关闭" in line or "连接发生错误" in line:
+            self.online = False
+        if "触发风控" in line:
+            self.awaiting_cookie = True
+            notify.notify("risk", "触发风控", "闲鱼要求滑块验证，请打开控制台更新 Cookie，否则机器人会停止")
+            safety.trip("机器人连接闲鱼时触发滑块验证")
+        elif "Cookie已更新" in line:
+            self.awaiting_cookie = False
+        if "Cookie已失效" in line:
+            self.cookie_invalid = True
+            store.log_event("risk", "", "Cookie 已失效")
+            notify.notify("risk", "Cookie 已失效", "闲鱼登录已失效，机器人已停止，请在控制台更新 Cookie 后重新启动")
 
     def _maybe_restart(self):
         if self.user_stopped or self.cookie_invalid or self.last_exit_code in (0, None):
@@ -297,25 +312,37 @@ class BotProcess:
         self._append("[控制台] 机器人意外退出，15 秒后自动重启...")
 
         def restart():
-            if not self.running() and not self.user_stopped:
+            with self.control_lock:
+                if self.running() or self.user_stopped:
+                    return
                 try:
-                    self.start()
+                    self._start()
                 except ValueError as e:
                     self._append(f"[控制台] 自动重启失败：{e}")
 
         threading.Timer(15, restart).start()
 
     def stop(self):
-        self.user_stopped = True
-        proc = self.proc
-        if proc is None or proc.poll() is not None:
-            return
-        self._append("[控制台] 正在停止机器人...")
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        with self.control_lock:
+            self.user_stopped = True
+            proc = self.proc
+            if proc is None or proc.poll() is not None:
+                return
+            self._append("[控制台] 正在停止机器人...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            # 等日志线程收尾，避免紧接着重启时把这次手动停止误判为异常退出
+            if self.pump_thread and self.pump_thread is not threading.current_thread():
+                self.pump_thread.join(timeout=3)
+
+    def restart(self):
+        with self.control_lock:
+            self.stop()
+            self._start()
 
     def submit_cookie(self, cookie):
         """风控时机器人在等待输入新 Cookie，把它写进子进程的标准输入"""
@@ -346,6 +373,13 @@ bot = BotProcess()
 
 # ---------------- 接口 ----------------
 
+def _int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _require_admin(user):
     if not user["is_admin"]:
         raise PermissionError("只有管理员可以进行这个操作")
@@ -369,27 +403,63 @@ def _overview():
     }
 
 
+TIME_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+# 程序内部维护的状态，不允许通过接口修改
+INTERNAL_SETTINGS = {"safety_pause_until", "safety_pause_reason", "polish_last_date"}
+
+
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def _save_settings(payload, user):
+    if not isinstance(payload, dict):
+        raise ValueError("参数格式不正确")
     settings = store.get_settings()
-    for key in store.DEFAULT_SETTINGS:
-        if key in payload:
-            settings[key] = payload[key]
+    for key, default in store.DEFAULT_SETTINGS.items():
+        if key not in payload or key in INTERNAL_SETTINGS:
+            continue
+        value = payload[key]
+        if isinstance(default, dict):
+            if not isinstance(value, dict):
+                raise ValueError(f"{key} 参数格式不正确")
+            # 只更新传入的字段，其余保持当前值
+            merged = dict(settings[key])
+            for field, field_default in default.items():
+                if field in value:
+                    merged[field] = _as_bool(value[field]) if isinstance(field_default, bool) else value[field]
+            value = merged
+        elif isinstance(default, bool):
+            value = _as_bool(value)
+        elif isinstance(default, int):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                raise ValueError("请填写数字")
+        else:
+            value = str(value if value is not None else "")
+        settings[key] = value
+
     hours = settings["business_hours"]
-    for field in ("start", "end"):
-        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(hours.get(field, ""))):
-            raise ValueError("营业时间格式应为 HH:MM，例如 09:00")
+    if not all(TIME_RE.fullmatch(str(hours.get(f, ""))) for f in ("start", "end")):
+        raise ValueError("营业时间格式应为 HH:MM，例如 09:00")
+    if hours["start"] == hours["end"]:
+        raise ValueError("营业时间的开始和结束不能相同")
+    if hours.get("mode") not in ("away", "silent"):
+        raise ValueError("非营业时间处理方式不正确")
     polish = settings["auto_polish"]
-    for field in ("window_start", "window_end"):
-        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(polish.get(field, ""))):
-            raise ValueError("擦亮时间格式应为 HH:MM，例如 08:00")
+    if not all(TIME_RE.fullmatch(str(polish.get(f, ""))) for f in ("window_start", "window_end")):
+        raise ValueError("擦亮时间格式应为 HH:MM，例如 08:00")
     if polish["window_start"] >= polish["window_end"]:
         raise ValueError("擦亮时间窗口的结束时间要晚于开始时间")
     if settings.get("safety_level") not in safety.LEVELS:
         raise ValueError("防风控模式不正确")
-    settings["manual_timeout_minutes"] = max(1, int(settings.get("manual_timeout_minutes") or 60))
-    if not str(settings.get("toggle_keywords") or "").strip():
+    settings["manual_timeout_minutes"] = max(1, settings["manual_timeout_minutes"])
+    if not settings["toggle_keywords"].strip():
         raise ValueError("人工接管关键词不能为空")
-    store.save_settings(settings)
+    store.save_settings({k: v for k, v in settings.items() if k not in INTERNAL_SETTINGS})
     return store.get_settings()
 
 
@@ -400,15 +470,14 @@ def _bot_action(action):
         elif action == "stop":
             bot.stop()
         else:
-            bot.stop()
-            bot.start()
+            bot.restart()
         return bot.status()
     return handler
 
 
 GET_ROUTES = {
     "/api/status": lambda q, u: bot.status(),
-    "/api/logs": lambda q, u: bot.logs_since(int(q.get("since", ["0"])[0] or 0)),
+    "/api/logs": lambda q, u: bot.logs_since(_int(q.get("since", ["0"])[0])),
     "/api/overview": lambda q, u: _overview(),
     "/api/settings": lambda q, u: store.get_settings(),
     "/api/providers": lambda q, u: {"providers": providers.list_providers(), "categories": providers.CATEGORIES},
@@ -423,7 +492,7 @@ GET_ROUTES = {
     "/api/chats": lambda q, u: list_chats(),
     "/api/messages": lambda q, u: chat_messages(q.get("chat_id", [""])[0]),
     "/api/items": lambda q, u: list_items(),
-    "/api/users": lambda q, u: auth.list_users(),
+    "/api/users": lambda q, u: _require_admin(u) or auth.list_users(),
     "/api/safety": lambda q, u: safety.status(),
     "/api/shop": lambda q, u: {"items": shop.list_my_items(), "task": shop.task_state(),
                                "next_polish": shop.scheduler.next_polish_time(),
@@ -470,7 +539,7 @@ POST_ROUTES = {
     "/api/listings/delete": lambda p, u: shop.delete_listing(p.get("id")),
     "/api/listings/ai_write": lambda p, u: shop.ai_write(p.get("brief", "")),
     "/api/users/password": lambda p, u: auth.change_password(u["id"], p.get("old_password"),
-                                                             p.get("new_password")),
+                                                             p.get("new_password"), u.get("token")),
 }
 
 
@@ -484,8 +553,12 @@ class Handler(BaseHTTPRequestHandler):
         return host in ("127.0.0.1", "localhost")
 
     def _token(self):
-        cookie = SimpleCookie(self.headers.get("Cookie") or "")
-        return cookie[SESSION_COOKIE].value if SESSION_COOKIE in cookie else ""
+        # 不用 SimpleCookie：本机其他程序写的非标准 Cookie 会让它整段解析失败
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == SESSION_COOKIE:
+                return value.strip()
+        return ""
 
     def _send(self, status, body, content_type="application/json; charset=utf-8", headers=None):
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -526,6 +599,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(401, {"error": "请先登录"})
         try:
             return self._send(200, handler(parse_qs(url.query), user))
+        except PermissionError as e:
+            return self._send(403, {"error": str(e)})
+        except ValueError as e:
+            return self._send(400, {"error": str(e)})
         except Exception as e:
             return self._send(500, {"error": f"出错了：{e}"})
 
@@ -535,13 +612,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "forbidden"})
         path = urlparse(self.path).path
         try:
-            length = int(self.headers.get("Content-Length") or 0)
+            length = _int(self.headers.get("Content-Length"))
+            if length < 0 or length > 30 * 1024 * 1024:
+                raise ValueError("请求内容过大")
             payload = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("参数格式不正确")
             if path == "/api/auth/register":
-                current = auth.user_by_token(self._token())
-                if auth.has_users() and not (current and current["is_admin"]):
-                    raise PermissionError("已经有账号了，请直接登录；新增账号请让管理员在「账号与安全」里添加")
-                auth.create_user(payload.get("username"), payload.get("password"), is_admin=not auth.has_users())
+                auth.create_user(payload.get("username"), payload.get("password"), is_admin=True, only_if_first=True)
                 return self._login(payload)
             if path == "/api/auth/login":
                 return self._login(payload)
@@ -556,6 +634,7 @@ class Handler(BaseHTTPRequestHandler):
             user = auth.user_by_token(self._token())
             if not user:
                 return self._send(401, {"error": "请先登录"})
+            user["token"] = self._token()
             result = handler(payload, user)
             return self._send(200, {"ok": True, "data": result})
         except PermissionError as e:
@@ -587,6 +666,7 @@ def main():
     print(f" 闲鱼 AutoAgent 控制台已启动：{url}")
     print(" 请在浏览器里操作；这个窗口不要关（关掉机器人也会停）")
     print("=" * 56)
+    shop.recover_interrupted()
     shop.scheduler.start()
     if store.get_settings().get("auto_start_bot"):
         try:

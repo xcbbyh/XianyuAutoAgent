@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 
 from . import store
@@ -25,8 +26,13 @@ def verify_password(password, stored):
         return False
 
 
+_create_lock = threading.Lock()
+
+
 def _validate(username, password):
-    username = (username or "").strip()
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise ValueError("用户名和密码格式不正确")
+    username = username.strip()
     if not 3 <= len(username) <= 32:
         raise ValueError("用户名长度需要 3～32 个字符")
     if len(password or "") < 6:
@@ -38,18 +44,24 @@ def has_users():
     return store.row("SELECT id FROM users LIMIT 1") is not None
 
 
-def create_user(username, password, is_admin=False):
+def create_user(username, password, is_admin=False, only_if_first=False):
+    """only_if_first：注册第一个管理员时使用，已有账号则拒绝（加锁防止同时注册出两个管理员）"""
     username = _validate(username, password)
-    if store.row("SELECT id FROM users WHERE username = ?", (username,)):
-        raise ValueError("用户名已存在")
-    return store.execute(
-        "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)",
-        (username, hash_password(password), 1 if is_admin else 0, time.time()),
-    )
+    with _create_lock:
+        if only_if_first and has_users():
+            raise PermissionError("已经有账号了，请直接登录")
+        if store.row("SELECT id FROM users WHERE username = ?", (username,)):
+            raise ValueError("用户名已存在")
+        return store.execute(
+            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)",
+            (username, hash_password(password), 1 if is_admin else 0, time.time()),
+        )
 
 
 def login(username, password):
-    user = store.row("SELECT * FROM users WHERE username = ?", ((username or "").strip(),))
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise ValueError("用户名或密码错误")
+    user = store.row("SELECT * FROM users WHERE username = ?", (username.strip(),))
     if not user or not verify_password(password or "", user["password_hash"]):
         # 固定延迟，降低暴力猜密码的速度
         time.sleep(0.5)
@@ -81,12 +93,14 @@ def list_users():
     return store.rows("SELECT id, username, is_admin, created_at FROM users ORDER BY id")
 
 
-def change_password(user_id, old_password, new_password):
+def change_password(user_id, old_password, new_password, keep_token=None):
     user = store.row("SELECT * FROM users WHERE id = ?", (user_id,))
-    if not user or not verify_password(old_password or "", user["password_hash"]):
+    if not user or not isinstance(old_password, str) or not verify_password(old_password, user["password_hash"]):
         raise ValueError("原密码不正确")
     _validate(user["username"], new_password)
     store.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_password), user_id))
+    # 改密码后其他设备上的登录全部失效
+    store.execute("DELETE FROM sessions WHERE user_id = ? AND token != ?", (user_id, keep_token or ""))
 
 
 def delete_user(user_id, current_user_id):

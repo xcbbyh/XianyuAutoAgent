@@ -96,6 +96,13 @@ def save_delivery_rule(payload):
         raise ValueError("请填写发货内容")
     if mode == "cards" and not stock:
         raise ValueError("请至少填写一条卡密")
+    if payload.get("id") and mode == "cards":
+        # 编辑期间可能已经发出了几条卡密，别把它们又加回库存
+        sent = {r["content"] for r in store.rows("SELECT content FROM deliveries WHERE rule_id = ?",
+                                                  (int(payload["id"]),))}
+        stock = [c for c in stock if not any(s == c or s.endswith("\n" + c) for s in sent)]
+        if not stock:
+            raise ValueError("填写的卡密都已经发出去了，请补充新的卡密")
     values = (name, item_id, title_keyword, mode, content, json.dumps(stock, ensure_ascii=False),
               1 if payload.get("enabled", True) else 0)
     if payload.get("id"):
@@ -119,14 +126,14 @@ def list_deliveries(limit=200):
 def take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name):
     """
     为这笔订单取出发货内容。
-    返回 (内容, 规则, 剩余库存)；同一个会话同一个商品 24 小时内只发一次。
+    返回 (内容, 规则, 剩余库存, 发货记录ID, 取出的卡密)；同一个会话同一个商品 24 小时内只发一次。
     """
     recent = store.row(
         "SELECT id FROM deliveries WHERE chat_id = ? AND item_id = ? AND created_at > ?",
         (chat_id, item_id, time.time() - 86400),
     )
     if recent:
-        return None, None, None
+        return None, None, None, None, None
 
     rules = store.rows("SELECT * FROM delivery_rules WHERE enabled = 1 ORDER BY (item_id = ''), id")
     rule = None
@@ -138,16 +145,16 @@ def take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name):
             rule = r
             break
     if not rule:
-        return None, None, None
+        return None, None, None, None, None
 
     with store.db() as conn:
         # 在同一个事务里取卡密，避免两个订单拿到同一条
         current = conn.execute("SELECT * FROM delivery_rules WHERE id = ?", (rule["id"],)).fetchone()
-        remaining = None
+        remaining = card = None
         if current["mode"] == "cards":
             stock = json.loads(current["stock"] or "[]")
             if not stock:
-                return None, dict(current), 0
+                return None, dict(current), 0, None, None
             card = stock.pop(0)
             remaining = len(stock)
             content = f"{current['content']}\n{card}".strip() if current["content"] else card
@@ -156,12 +163,25 @@ def take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name):
         else:
             content = current["content"]
         conn.execute("UPDATE delivery_rules SET delivered = delivered + 1 WHERE id = ?", (current["id"],))
-        conn.execute(
+        delivery_id = conn.execute(
             "INSERT INTO deliveries (rule_id, rule_name, chat_id, item_id, buyer_id, buyer_name, content, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (current["id"], current["name"], chat_id, item_id, buyer_id, buyer_name, content, time.time()),
-        )
-    return content, dict(current), remaining
+        ).lastrowid
+    return content, dict(current), remaining, delivery_id, card
+
+
+def rollback_delivery(delivery_id, rule_id, card=None):
+    """发货消息没发出去：删除发货记录，卡密放回库存最前面"""
+    with store.db() as conn:
+        conn.execute("DELETE FROM deliveries WHERE id = ?", (delivery_id,))
+        conn.execute("UPDATE delivery_rules SET delivered = MAX(delivered - 1, 0) WHERE id = ?", (rule_id,))
+        if card:
+            current = conn.execute("SELECT stock FROM delivery_rules WHERE id = ?", (rule_id,)).fetchone()
+            if current:
+                stock = [card] + json.loads(current["stock"] or "[]")
+                conn.execute("UPDATE delivery_rules SET stock = ? WHERE id = ?",
+                             (json.dumps(stock, ensure_ascii=False), rule_id))
 
 
 # ---------------- 黑名单 ----------------

@@ -8,8 +8,7 @@ from loguru import logger
 from dotenv import load_dotenv, set_key
 from XianyuApis import XianyuApis
 import sys
-import random
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
@@ -59,6 +58,10 @@ class XianyuLive:
         self.chat_locks = defaultdict(asyncio.Lock)
         # 正在处理中的消息任务
         self.message_tasks = set()
+        # 最近自动发出的消息，用来识别服务器回传，避免重复记录
+        self.recent_sent = defaultdict(lambda: deque(maxlen=30))
+        # 会话 -> (买家ID, 买家昵称, 商品ID)
+        self.chat_meta = {}
 
     async def refresh_token(self):
         """刷新token"""
@@ -112,17 +115,178 @@ class XianyuLive:
                 logger.error(f"Token刷新循环出错: {e}")
                 await asyncio.sleep(60)
 
-    async def send_reply(self, ws, chat_id, to_id, item_id, text, record=True):
-        """自动发送回复：固定带防风控延迟，并写入对话上下文"""
-        if record:
-            self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", text)
+    async def reply_to_buyer(self, chat_id, item_id, buyer_id, buyer_name, text):
+        """按优先级处理一条买家消息：人工接管 > 限流 > 关键词 > AI 开关 > 营业时间 > AI 回复"""
+        record_user = lambda: self.context_manager.add_message_by_chat(chat_id, buyer_id, item_id, "user", text)
+
+        # 如果当前会话处于人工接管模式，不进行自动回复
+        if self.is_manual_mode(chat_id):
+            logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
+            record_user()
+            return
+
+        # 防风控：同一买家短时间内自动回复过多时暂停
+        if not self.hooks.allow_reply(chat_id, buyer_name):
+            logger.warning(f"🛡️ 买家 {buyer_name} 一小时内自动回复已达上限，暂停自动回复")
+            record_user()
+            return
+
+        # 关键词回复优先于 AI
+        keyword_reply = self.hooks.keyword_reply(text, item_id)
+        if keyword_reply:
+            logger.info(f"🔑 命中关键词回复: {keyword_reply}")
+            record_user()
+            await self.send_reply(chat_id, buyer_id, item_id, keyword_reply)
+            self.hooks.event("keyword_reply", chat_id, keyword_reply)
+            return
+
+        # AI 总开关关闭，或者不在营业时间
+        if not self.hooks.ai_enabled():
+            logger.info("AI 自动回复已在控制台关闭，跳过")
+            record_user()
+            return
+        away = self.hooks.away_reply(chat_id)
+        if away is not None:
+            record_user()
+            if away:
+                logger.info("🌙 非营业时间，发送离线提示")
+                await self.send_reply(chat_id, buyer_id, item_id, away)
+                self.hooks.event("away_reply", chat_id, away)
+            else:
+                logger.info("🌙 非营业时间，不回复")
+            return
+
+        item_info = await asyncio.to_thread(self.get_item_info_cached, item_id)
+        if not item_info:
+            return
+
+        item_description=f"当前商品的信息如下：{self.build_item_description(item_info)}"
+
+        # 获取完整的对话上下文
+        context = self.context_manager.get_context_by_chat(chat_id)
+        # 生成回复：放到线程里执行，调用大模型时不阻塞其他买家的消息和心跳
+        try:
+            bot_reply, intent = await asyncio.to_thread(bot.generate_reply_with_intent, text, item_description, context)
+        except Exception as e:
+            logger.error(f"AI 生成回复失败: {e}")
+            bot_reply, intent = self.hooks.fallback_reply(), "default"
+            if not bot_reply:
+                record_user()
+                return
+            logger.info("使用控制台设置的兜底话术回复")
+
+        # 检查是否需要回复
+        if bot_reply == "-":
+            logger.info(f"[无需回复] 用户 {buyer_name} 的消息被识别为无需回复类型")
+            return
+
+        # 添加用户消息到上下文
+        record_user()
+
+        # 检查是否为价格意图，如果是则增加议价次数
+        if intent == "price":
+            self.context_manager.increment_bargain_count_by_chat(chat_id)
+            bargain_count = self.context_manager.get_bargain_count_by_chat(chat_id)
+            logger.info(f"用户 {buyer_name} 对商品 {item_id} 的议价次数: {bargain_count}")
+
+        # AI 生成期间卖家可能已经接管了这个会话
+        if self.is_manual_mode(chat_id):
+            logger.info(f"🔴 会话 {chat_id} 在生成回复期间被人工接管，不发送 AI 回复")
+            return
+
+        logger.info(f"机器人回复: {bot_reply}")
+        await self.send_reply(chat_id, buyer_id, item_id, bot_reply)
+        self.hooks.event("ai_reply", chat_id, bot_reply)
+
+    async def handle_paid_order(self, chat_id, item_id, buyer_id, buyer_name):
+        """买家已付款：按自动发货规则发送内容（人工接管时也照常发货）"""
+        async with self.chat_locks[chat_id]:
+            if self.hooks.is_new_order(chat_id, item_id):
+                self.hooks.event("order", chat_id, f"{buyer_name} 已付款（商品 {item_id}）")
+            item_info = await asyncio.to_thread(self.get_item_info_cached, item_id)
+            item_title = (item_info or {}).get("title", "")
+            delivery = self.hooks.take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name)
+            if not delivery:
+                return
+            logger.info(f"📦 自动发货给 {buyer_name}（商品 {item_id}）")
+            try:
+                await self.send_reply(chat_id, buyer_id, item_id, delivery["content"])
+            except Exception as e:
+                # 没发出去就把卡密退回库存，避免买家没收到、卡密却被扣掉
+                logger.error(f"自动发货消息发送失败，已退回库存，请手动发货: {e}")
+                self.hooks.rollback_delivery(delivery, buyer_name)
+                return
+            self.hooks.event("delivery", chat_id, f"已给 {buyer_name} 自动发货（商品 {item_title or item_id}）")
+
+    async def handle_paid_order_notice(self, session_id):
+        """
+        处理闲鱼推送的「等待卖家发货」订单状态消息。
+        这类消息只带会话 ID，需要从聊天记录里找出对应的买家和商品。
+        """
+        try:
+            if session_id in self.chat_meta:
+                buyer_id, buyer_name, item_id = self.chat_meta[session_id]
+                chat_id = session_id
+            else:
+                found = self.context_manager.find_buyer_by_chat(session_id)
+                if not found:
+                    logger.info(f"订单 {session_id} 没有聊天记录，等待会话里的付款卡片再处理自动发货")
+                    return
+                chat_id, buyer_id, item_id = found
+                buyer_name = "买家"
+            await self.handle_paid_order(chat_id, item_id, buyer_id, buyer_name)
+        except Exception as e:
+            logger.error(f"处理付款通知失败: {e}")
+
+    def is_system_card(self, message):
+        """是否为闲鱼系统发出的卡片消息（买家自己打的字不是）"""
+        try:
+            m1 = message.get("1") or {}
+            content_type = ((m1.get("6") or {}).get("3") or {}).get("4", 0)
+            biz_tag = str((m1.get("10") or {}).get("bizTag", "") or "")
+            return str(m1.get("7", 0)) == "1" or str(content_type) == "6" or "taskName" in biz_tag
+        except Exception:
+            return False
+
+    def is_own_echo(self, chat_id, text):
+        """是否为机器人刚刚自动发出的消息的回传"""
+        sent = self.recent_sent.get(chat_id)
+        if not sent:
+            return False
+        now = time.time()
+        for index, (sent_text, sent_at) in enumerate(sent):
+            if sent_text == text and now - sent_at < 180:
+                del sent[index]
+                return True
+        return False
+
+    async def send_reply(self, chat_id, to_id, item_id, text):
+        """
+        自动发送回复：固定带防风控延迟；使用当前连接发送，失败自动重试；
+        发送成功后才写入对话上下文，发送失败抛出异常。
+        """
         delay = self.hooks.human_delay(text, chat_id)
         logger.info(f"模拟人工输入，延迟发送 {delay:.2f} 秒...")
         await asyncio.sleep(delay)
-        await self.send_msg(ws, chat_id, to_id, text)
+        entry = (text, time.time())
+        self.recent_sent[chat_id].append(entry)
+        for attempt in range(3):
+            try:
+                # 等待期间连接可能已经重建，每次都取最新的连接
+                await self.send_msg(self.ws, chat_id, to_id, text)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    if entry in self.recent_sent[chat_id]:
+                        self.recent_sent[chat_id].remove(entry)
+                    logger.error(f"发送消息失败（已重试 3 次）: {e}")
+                    raise
+                logger.warning(f"发送消息失败，3 秒后重试: {e}")
+                await asyncio.sleep(3)
+        self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", text)
 
     def get_item_info_cached(self, item_id):
-        """从数据库获取商品信息，如果不存在则从API获取并保存"""
+        """从数据库获取商品信息，如果不存在则从API获取并保存（同步方法，请在线程里调用）"""
         item_info = self.context_manager.get_item_info(item_id)
         if item_info:
             logger.info(f"从数据库获取商品信息: {item_id}")
@@ -447,6 +611,8 @@ class XianyuLive:
                     user_id = message['1'].split('@')[0]
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     logger.info(f'交易成功 {user_url} 等待卖家发货')
+                    # 这是闲鱼服务端推送的订单状态，买家无法伪造，可以放心触发自动发货
+                    await self.handle_paid_order_notice(user_id)
                     return
 
             except:
@@ -481,10 +647,13 @@ class XianyuLive:
                 logger.warning("无法获取商品ID")
                 return
 
-            # 检查是否为卖家（自己）发送的控制命令
+            # 检查是否为卖家（自己）发送的消息
             if send_user_id == self.myid:
+                # 机器人自动发出的消息会从服务器回传一次，发送时已经记录过，这里忽略
+                if self.is_own_echo(chat_id, send_message):
+                    return
                 logger.debug("检测到卖家消息，检查是否为控制命令")
-                
+
                 # 检查切换命令
                 if self.check_toggle_keywords(send_message):
                     mode = self.toggle_manual_mode(chat_id)
@@ -493,30 +662,27 @@ class XianyuLive:
                     else:
                         logger.info(f"🟢 已恢复会话 {chat_id} 的自动回复 (商品: {item_id})")
                     return
-                
+
                 # 记录卖家人工回复
                 self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", send_message)
                 logger.info(f"卖家人工回复 (会话: {chat_id}, 商品: {item_id}): {send_message}")
                 return
-            
+
             logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
+            # 记住会话对应的买家和商品，订单状态通知只带会话 ID 时要用
+            self.chat_meta[chat_id] = (send_user_id, send_user_name, item_id)
 
             # 黑名单买家：不回复也不通知
             if self.hooks.is_blacklisted(send_user_id):
                 logger.info(f"买家 {send_user_name} 在黑名单中，跳过")
                 return
 
-            # 付款消息：自动发货（人工接管时也照常发货）
+            # 付款：只认闲鱼系统发出的付款卡片，买家自己打字「我已付款」不会触发发货
             if self.hooks.is_payment_message(send_message):
-                self.hooks.event("order", chat_id, f"{send_user_name} 已付款（商品 {item_id}）")
-                item_info = self.get_item_info_cached(item_id)
-                item_title = (item_info or {}).get("title", "")
-                content = self.hooks.delivery_content(chat_id, item_id, item_title, send_user_id, send_user_name)
-                if content:
-                    logger.info(f"📦 自动发货给 {send_user_name}（商品 {item_id}）")
-                    await self.send_reply(websocket, chat_id, send_user_id, item_id, content)
-                    self.hooks.event("delivery", chat_id, f"已给 {send_user_name} 自动发货（商品 {item_title or item_id}）")
-                return
+                if self.is_system_card(message):
+                    await self.handle_paid_order(chat_id, item_id, send_user_id, send_user_name)
+                    return
+                logger.warning(f"⚠️ 买家 {send_user_name} 发送了付款字样，但不是闲鱼系统付款通知，不会自动发货")
 
             # 带中括号的是闲鱼系统卡片（如「[买家已拍下]」），不回复
             if self.is_bracket_system_message(send_message):
@@ -528,87 +694,9 @@ class XianyuLive:
 
             self.hooks.event("message", chat_id, f"{send_user_name}：{send_message}")
 
-            # 如果当前会话处于人工接管模式，不进行自动回复
-            if self.is_manual_mode(chat_id):
-                logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
-                # 添加用户消息到上下文
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                return
-
-            # 防风控：同一买家短时间内自动回复过多时暂停
-            if not self.hooks.allow_reply(chat_id, send_user_name):
-                logger.warning(f"🛡️ 买家 {send_user_name} 一小时内自动回复已达上限，暂停自动回复")
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                return
-
-            # 关键词回复优先于 AI
-            keyword_reply = self.hooks.keyword_reply(send_message, item_id)
-            if keyword_reply:
-                logger.info(f"🔑 命中关键词回复: {keyword_reply}")
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                await self.send_reply(websocket, chat_id, send_user_id, item_id, keyword_reply)
-                self.hooks.event("keyword_reply", chat_id, keyword_reply)
-                return
-
-            # AI 总开关关闭，或者不在营业时间
-            if not self.hooks.ai_enabled():
-                logger.info("AI 自动回复已在控制台关闭，跳过")
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                return
-            away = self.hooks.away_reply(chat_id)
-            if away is not None:
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                if away:
-                    logger.info("🌙 非营业时间，发送离线提示")
-                    await self.send_reply(websocket, chat_id, send_user_id, item_id, away)
-                    self.hooks.event("away_reply", chat_id, away)
-                else:
-                    logger.info("🌙 非营业时间，不回复")
-                return
-
-            # 同一个会话的消息按顺序处理，不同买家之间互不等待
+            # 同一买家的消息排队处理（保证回复顺序、限流准确），不同买家之间互不等待
             async with self.chat_locks[chat_id]:
-                item_info = self.get_item_info_cached(item_id)
-                if not item_info:
-                    return
-
-                item_description=f"当前商品的信息如下：{self.build_item_description(item_info)}"
-
-                # 获取完整的对话上下文
-                context = self.context_manager.get_context_by_chat(chat_id)
-                # 生成回复：放到线程里执行，调用大模型时不阻塞其他买家的消息和心跳
-                try:
-                    bot_reply, intent = await asyncio.to_thread(
-                        bot.generate_reply_with_intent,
-                        send_message,
-                        item_description,
-                        context,
-                    )
-                except Exception as e:
-                    logger.error(f"AI 生成回复失败: {e}")
-                    bot_reply, intent = self.hooks.fallback_reply(), "default"
-                    if not bot_reply:
-                        self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-                        return
-                    logger.info("使用控制台设置的兜底话术回复")
-
-                # 检查是否需要回复
-                if bot_reply == "-":
-                    logger.info(f"[无需回复] 用户 {send_user_name} 的消息被识别为无需回复类型")
-                    return
-
-                # 添加用户消息到上下文
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-
-                # 检查是否为价格意图，如果是则增加议价次数
-                if intent == "price":
-                    self.context_manager.increment_bargain_count_by_chat(chat_id)
-                    bargain_count = self.context_manager.get_bargain_count_by_chat(chat_id)
-                    logger.info(f"用户 {send_user_name} 对商品 {item_id} 的议价次数: {bargain_count}")
-
-                logger.info(f"机器人回复: {bot_reply}")
-                await self.send_reply(websocket, chat_id, send_user_id, item_id, bot_reply, record=True)
-                self.hooks.event("ai_reply", chat_id, bot_reply)
+                await self.reply_to_buyer(chat_id, item_id, send_user_id, send_user_name, send_message)
             
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")

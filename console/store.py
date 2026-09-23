@@ -278,7 +278,8 @@ def dashboard_stats(days=7):
     for r in rows(
         "SELECT type, COUNT(*) AS n FROM events WHERE created_at >= ? GROUP BY type", (today_start,)
     ):
-        today[r["type"]] = r["n"]
+        if r["type"] in today:
+            today[r["type"]] = r["n"]
 
     daily = []
     for i in range(days):
@@ -294,7 +295,9 @@ def dashboard_stats(days=7):
             key = "message" if r["type"] == "message" else "replies"
             daily[index][key] += 1
 
-    recent = rows("SELECT type, chat_id, detail, created_at FROM events ORDER BY id DESC LIMIT 12")
+    known = ",".join(f"'{t}'" for t in EVENT_TYPES)
+    recent = rows(f"SELECT type, chat_id, detail, created_at FROM events WHERE type IN ({known}) "
+                  "ORDER BY id DESC LIMIT 12")
     buyers_today = row(
         "SELECT COUNT(DISTINCT chat_id) AS n FROM events WHERE type = 'message' AND created_at >= ?",
         (today_start,),
