@@ -229,23 +229,12 @@ class XianyuLive:
 
     async def send_or_queue(self, kind, chat_id, item_id, buyer_id, buyer_name, buyer_message, text):
         """
-        默认不直接发：放进控制台「待审核回复」，卖家点「同意发送」后才发出。
-        只有卖家在控制台明确关掉对应的「发送前需要我同意」开关，才直接发送。
+        写死的规则：机器人从不直接给任何人发消息，只把回复放进控制台「待审核回复」，
+        卖家点「同意发送」并通过闲鱼规则检查后才发出。没有任何开关可以关掉这一步。
         """
-        problems = [] if self.hooks.needs_approval(kind) else self.hooks.check_reply(chat_id, text, self.item_title(item_id), kind)
-        if problems:
-            logger.warning(f"⚠️ 这条回复没通过安全检查，改为放进「待审核回复」: {'；'.join(problems)}")
-        if problems or self.hooks.needs_approval(kind):
-            self.hooks.queue_reply(kind, chat_id, buyer_id, buyer_name, item_id, self.item_title(item_id),
-                                   buyer_message, text)
-            logger.info(f"📝 回复没有发出，已放进控制台「待审核回复」，等你点「同意发送」: {text}")
-            return
-        try:
-            await self.send_reply(chat_id, buyer_id, item_id, text)
-        except Exception as e:
-            safety.trip(f"自动回复发送失败（{str(e)[:60]}），可能被禁言或触发风控")
-            raise
-        self.hooks.event(approvals.EVENT_OF_KIND[kind], chat_id, text)
+        self.hooks.queue_reply(kind, chat_id, buyer_id, buyer_name, item_id, self.item_title(item_id),
+                               buyer_message, text)
+        logger.info(f"📝 回复没有发出，已放进控制台「待审核回复」，等你点「同意发送」: {text}")
 
     async def handle_paid_order(self, chat_id, item_id, buyer_id, buyer_name):
         """买家已付款：按自动发货规则发送内容（人工接管时也照常发货）"""
@@ -261,22 +250,10 @@ class XianyuLive:
             delivery = self.hooks.take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name)
             if not delivery:
                 return
-            if self.hooks.needs_approval("delivery"):
-                # 卡密已经预留，同意后发出；点「不发送」会退回库存
-                self.hooks.queue_reply("delivery", chat_id, buyer_id, buyer_name, item_id, item_title,
-                                       "（买家已付款）", delivery["content"], delivery=delivery)
-                logger.info(f"📝 {buyer_name} 已付款，发货内容已放进「待审核回复」，等你点「同意发送」")
-                return
-            logger.info(f"📦 自动发货给 {buyer_name}（商品 {item_id}）")
-            try:
-                await self.send_reply(chat_id, buyer_id, item_id, delivery["content"])
-            except Exception as e:
-                # 没发出去就把卡密退回库存，避免买家没收到、卡密却被扣掉
-                logger.error(f"自动发货消息发送失败，已退回库存，请手动发货: {e}")
-                self.hooks.rollback_delivery(delivery, buyer_name)
-                safety.trip(f"自动发货消息发送失败（{str(e)[:60]}），可能被禁言或触发风控")
-                return
-            self.hooks.event("delivery", chat_id, f"已给 {buyer_name} 自动发货（商品 {item_title or item_id}）")
+            # 写死的规则：发货内容也要卖家同意才发。卡密已经预留，点「不发送」会退回库存
+            self.hooks.queue_reply("delivery", chat_id, buyer_id, buyer_name, item_id, item_title,
+                                   "（买家已付款）", delivery["content"], delivery=delivery)
+            logger.info(f"📝 {buyer_name} 已付款，发货内容已放进「待审核回复」，等你点「同意发送」")
 
     async def handle_paid_order_notice(self, session_id):
         """

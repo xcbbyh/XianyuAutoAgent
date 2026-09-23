@@ -472,12 +472,10 @@ PAGES.reply = async (el) => {
       <div class="card">
         <div class="card-head"><h3>AI 自动回复</h3><span class="desc">改完点保存，几秒内生效，不用重启机器人</span></div>
         <div style="margin-bottom:18px">${switchHtml("ai_enabled", s.ai_enabled, "开启 AI 自动回复（关闭后只处理关键词回复和自动发货）")}</div>
-        <div class="banner warn" style="margin-bottom:14px"><div class="grow"><b>发送前需要我同意（建议全部开着）</b>
-          <div class="help">开着时机器人不会直接给买家发消息，只把写好的回复放进「待审核回复」，你点「同意发送」才发出去。
-          机器人只会处理你自己发布的商品的聊天；你去买别人东西的聊天，它一律不碰。</div></div></div>
-        <div style="margin-bottom:10px">${switchHtml("reply_approval", s.reply_approval, "AI 回复、离线提示、兜底话术发送前需要我同意")}</div>
-        <div style="margin-bottom:10px">${switchHtml("keyword_approval", s.keyword_approval, "关键词回复发送前需要我同意")}</div>
-        <div style="margin-bottom:18px">${switchHtml("delivery_approval", s.delivery_approval, "自动发货内容（卡密）发送前需要我同意")}</div>
+        <div class="banner warn" style="margin-bottom:18px"><div class="grow"><b>🔒 写死的规则（不能关）</b>
+          <div class="help">机器人从不直接给任何人发消息：AI 回复、关键词回复、离线提示、发货内容都先放进「待审核回复」，你点「同意发送」才发出去。
+          只处理你自己发布的商品的聊天；你是买家的聊天、查不到卖家的聊天，一律不碰，由你本人回复。
+          闲鱼规则检查和真人模式也写在代码里，改设置、改提示词都关不掉。</div></div></div>
         <div class="grid-2">
           <label class="field"><span>人工接管关键词</span><input type="text" name="toggle_keywords" value="${esc(s.toggle_keywords)}">
             <div class="help">你在闲鱼里对某个买家发送这个内容，该对话切换为人工回复；再发一次交还给 AI。</div></label>
@@ -505,7 +503,6 @@ PAGES.reply = async (el) => {
   trackDirty($("#replyForm"), (d) => api("/api/settings", {
     ai_enabled: d.ai_enabled, toggle_keywords: d.toggle_keywords, manual_timeout_minutes: Number(d.manual_timeout_minutes),
     fallback_reply: d.fallback_reply,
-    reply_approval: d.reply_approval, keyword_approval: d.keyword_approval, delivery_approval: d.delivery_approval,
     business_hours: { enabled: d.bh_enabled, start: d.bh_start, end: d.bh_end, mode: d.bh_mode, away_message: d.bh_away_message },
   }));
 };
@@ -525,19 +522,16 @@ PAGES.approvals = async (el) => {
   state.lastPending = d.replies.filter((r) => r.status === "pending").length;
   const pending = d.replies.filter((r) => r.status === "pending");
   const others = d.replies.filter((r) => r.status !== "pending");
-  const off = [["reply_approval", "AI 回复"], ["keyword_approval", "关键词回复"], ["delivery_approval", "自动发货"]]
-    .filter(([k]) => !d.settings[k]).map(([, n]) => n);
   const botOk = d.bot.running && d.bot.online;
   el.innerHTML = `
-    <div class="banner ${off.length ? "bad" : "info"}"><div class="grow">
-      <b>${off.length ? `⚠️ 这些回复现在不用你同意就会直接发出：${off.join("、")}` : "🔒 机器人不会自己给买家发消息"}</b>
-      <div class="help">${off.length ? "如果要全部先审核，到「AI 自动回复」页面把「发送前需要我同意」的开关打开。" :
-        "买家发来消息后，机器人写好的回复先放在这里。你点「同意发送」才会发给买家，点「不发送」就丢掉。发送前可以改文字。"}
-        只处理你自己发布的商品的聊天，你是买家的聊天一律不碰。
+    <div class="banner info"><div class="grow">
+      <b>🔒 机器人不会自己给任何人发消息（写死的，不能关）</b>
+      <div class="help">买家发来消息后，机器人写好的回复先放在这里。你点「同意发送」才会发给买家，点「不发送」就丢掉。发送前可以改文字。
+        只处理你自己发布的商品的聊天，你是买家的聊天、查不到卖家的聊天一律不碰。
         发送前还会按闲鱼规则检查：敏感词（微信、全新、快递发货等）、AI 腔（提到 AI/机器人、客服腔、表情、列卖点、太长）、同一个聊天 2 分钟内只发一条、每小时最多 3 条、全账号每小时最多 15 人、夜里 23:00-08:30 不发、不发和之前几乎一样的话。
         活体动物、药品、食品、虚拟账号、证件票据等敏感商品，以及问「你是AI吗」、只回「啥」「？」、要联系方式、骂人的聊天，机器人不写回复，会提醒你本人去回。
         一旦出现滑块验证、发送失败等风控信号，所有自动功能停 24 小时。</div></div>
-      ${off.length ? `<button class="btn" data-go="reply">去打开</button>` : ""}</div>
+</div>
     ${!botOk && d.replies.some((r) => r.status === "approved") ? `<div class="banner warn"><div class="grow"><b>机器人没有在线</b>
       <div class="help">已同意的回复要等机器人启动并连上闲鱼后才会发出。</div></div></div>` : ""}
     <div class="card">
@@ -779,9 +773,8 @@ PAGES.safety = async (el) => {
   const st = await api("/api/safety");
   const levels = Object.entries(st.levels);
   el.innerHTML = `
-    ${st.pause.paused ? `<div class="banner bad"><div class="grow"><b>🛡️ 熔断中：擦亮、上架已暂停</b>
-      <span>${esc(st.pause.reason)}，将在 ${fmtTs(st.pause.until)} 自动恢复。建议先打开闲鱼网页版过一下滑块，再更新 Cookie。</span></div>
-      <button class="btn" id="resumeBtn">我已处理，立即恢复</button></div>`
+    ${st.pause.paused ? `<div class="banner bad"><div class="grow"><b>🛡️ 熔断中：自动回复、擦亮、上架已全部暂停</b>
+      <span>${esc(st.pause.reason)}，将在 ${fmtTs(st.pause.until)} 自动恢复（按闲鱼规则必须停满 24 小时，不能提前恢复）。这段时间请你本人在闲鱼里回复，也可以先打开闲鱼网页版过一下滑块，再更新 Cookie。</span></div></div>`
       : `<div class="banner info"><div class="grow"><b>🛡️ 防风控保护运行中</b>
       <span class="muted">当前模式「${esc(st.params.label)}」${st.quiet ? " · 现在是夜间静默时段" : ""} · 今天已擦亮 ${st.today.polish} 次、自动上架 ${st.today.publish}/${st.params.publish_daily_limit} 个</span></div></div>`}
     <div class="card">
@@ -824,9 +817,6 @@ PAGES.safety = async (el) => {
     await run(() => api("/api/safety/level", { level: b.dataset.level }), "已切换防风控模式");
     navigate("safety", true);
   }));
-  $("#resumeBtn")?.addEventListener("click", () => confirmBox("确定已经在闲鱼网页版处理过验证了吗？过早恢复可能再次触发风控。", async () => {
-    await api("/api/safety/resume", {}); toast("已恢复"); navigate("safety", true);
-  }, "立即恢复"));
 };
 
 /* ---------------- 商品管理 ---------------- */

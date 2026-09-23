@@ -180,11 +180,6 @@ DEFAULT_SETTINGS = {
     # 自动擦亮：每天在时间窗口内随机挑一个时间执行
     "auto_polish": {"enabled": False, "window_start": "08:00", "window_end": "10:00"},
     "polish_last_date": "",
-    # 发送前需要卖家同意（默认全部开启）：机器人只把回复放进「待审核回复」，卖家点「同意发送」才发出
-    # 注意：这几个是新加的设置项，旧版本没保存过，更新后会自动用这里的默认值（开启）
-    "reply_approval": True,      # AI 回复、离线提示、兜底话术
-    "keyword_approval": True,    # 关键词回复
-    "delivery_approval": True,   # 自动发货内容
     # 网页截图：登录网址和要截图的页面列表（在「网页截图」页面单独保存）
     "screenshot_login_url": "",
     "screenshot_pages": [],

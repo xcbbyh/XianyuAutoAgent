@@ -96,18 +96,6 @@ class BotHooks:
 
     # ---------------- 发送前审核 ----------------
 
-    def needs_approval(self, kind):
-        """
-        这类回复发送前是否需要卖家同意。默认需要；读取配置出错时也按「需要」处理，宁可不发。
-        每次都直接读数据库，不用缓存：卖家刚改的开关立刻生效。
-        """
-        key = approvals.SETTING_OF_KIND.get(kind, "reply_approval")
-        try:
-            return store.get_settings().get(key, True) is not False
-        except Exception as e:
-            logger.warning(f"读取审核开关失败，按需要审核处理：{e}")
-            return True
-
     def queue_reply(self, kind, chat_id, buyer_id, buyer_name, item_id, item_title, buyer_message, reply,
                     delivery=None):
         """放进「待审核回复」并推送通知（不会发给买家）"""

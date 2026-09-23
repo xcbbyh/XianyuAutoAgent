@@ -480,9 +480,7 @@ def _bot_action(action):
 
 GET_ROUTES = {
     "/api/status": lambda q, u: {**bot.status(), "pending_replies": approvals.pending_count()},
-    "/api/replies": lambda q, u: {"replies": approvals.list_replies(), "bot": bot.status(),
-                                  "settings": {k: store.get_settings()[k] for k in
-                                               ("reply_approval", "keyword_approval", "delivery_approval")}},
+    "/api/replies": lambda q, u: {"replies": approvals.list_replies(), "bot": bot.status()},
     "/api/logs": lambda q, u: bot.logs_since(_int(q.get("since", ["0"])[0])),
     "/api/overview": lambda q, u: _overview(),
     "/api/settings": lambda q, u: store.get_settings(),
@@ -538,7 +536,6 @@ POST_ROUTES = {
         p.get("username"), p.get("password"), bool(p.get("is_admin"))),
     "/api/users/delete": lambda p, u: _require_admin(u) or auth.delete_user(p.get("id"), u["id"]),
     "/api/safety/level": lambda p, u: _save_settings({"safety_level": p.get("level")}, u),
-    "/api/safety/resume": lambda p, u: safety.resume(),
     "/api/shop/sync": lambda p, u: shop.start_sync(),
     "/api/shop/polish_all": lambda p, u: shop.start_polish_all(),
     "/api/shop/polish": lambda p, u: shop.polish_one(p.get("item_id", "")),
