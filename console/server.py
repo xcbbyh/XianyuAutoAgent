@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import dotenv_values, set_key
 
-from . import assistant, auth, browser, notify, providers, rules, safety, shop, store
+from . import approvals, assistant, auth, browser, notify, providers, rules, safety, shop, store
 
 BASE_DIR = store.BASE_DIR
 ENV_PATH = store.ENV_PATH
@@ -479,7 +479,10 @@ def _bot_action(action):
 
 
 GET_ROUTES = {
-    "/api/status": lambda q, u: bot.status(),
+    "/api/status": lambda q, u: {**bot.status(), "pending_replies": approvals.pending_count()},
+    "/api/replies": lambda q, u: {"replies": approvals.list_replies(), "bot": bot.status(),
+                                  "settings": {k: store.get_settings()[k] for k in
+                                               ("reply_approval", "keyword_approval", "delivery_approval")}},
     "/api/logs": lambda q, u: bot.logs_since(_int(q.get("since", ["0"])[0])),
     "/api/overview": lambda q, u: _overview(),
     "/api/settings": lambda q, u: store.get_settings(),
@@ -554,6 +557,9 @@ POST_ROUTES = {
     "/api/listings/save": lambda p, u: shop.save_listing(p),
     "/api/listings/delete": lambda p, u: shop.delete_listing(p.get("id")),
     "/api/listings/ai_write": lambda p, u: shop.ai_write(p.get("brief", "")),
+    "/api/replies/approve": lambda p, u: approvals.approve(p.get("id"), p.get("text")),
+    "/api/replies/reject": lambda p, u: approvals.reject(p.get("id")),
+    "/api/replies/reject_all": lambda p, u: approvals.reject_all_pending(),
     "/api/assistant/chat": lambda p, u: assistant.chat(p.get("messages")),
     "/api/assistant/confirm": lambda p, u: assistant.confirm(p.get("id", ""), p.get("extra")),
     "/api/assistant/cancel": lambda p, u: assistant.cancel(p.get("id", "")),
