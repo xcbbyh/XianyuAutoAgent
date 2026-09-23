@@ -59,6 +59,7 @@ COPY prompts/default_prompt_example.txt prompts/default_prompt.txt
 # 只复制绝对必要的文件
 COPY main.py XianyuAgent.py XianyuApis.py context_manager.py ./
 COPY utils/ utils/
+COPY console/ console/
 
 # 容器启动时运行的命令
 CMD ["python", "main.py"]

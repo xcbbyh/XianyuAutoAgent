@@ -1,0 +1,128 @@
+"""
+机器人扩展功能入口（main.py 调用）
+
+把控制台里的配置接到原有机器人流程上：关键词回复、自动发货、黑名单、
+营业时间、AI 开关、通知推送、数据统计，以及固定开启的防风控发送延迟。
+这里的任何异常都不应该影响原有自动回复，所以每个方法都自带兜底。
+"""
+import random
+import re
+import time
+
+from loguru import logger
+
+from . import notify, rules, store
+
+# 付款后闲鱼会在会话里推送这类系统卡片
+PAYMENT_PATTERN = re.compile(r"我已付款|已付款.{0,4}(待|等待).{0,2}发货|等待你发货|等待卖家发货")
+
+# ---- 防风控发送延迟（固定开启，不提供关闭选项）----
+# 真人看到消息再打字需要时间，秒回容易被平台识别为机器人
+DELAY_BASE = (1.5, 3.5)      # 看消息、思考的时间（秒）
+DELAY_PER_CHAR = (0.08, 0.2)  # 每个字的打字时间（秒）
+DELAY_MAX = 12.0             # 上限，避免长回复让买家等太久
+
+AWAY_REPLY_INTERVAL = 6 * 3600  # 同一个买家的离线提示 6 小时内只发一次
+
+
+class BotHooks:
+    def __init__(self):
+        self._settings = None
+        self._settings_time = 0
+        self._away_sent = {}
+
+    def settings(self):
+        # 缓存 3 秒：控制台改完配置几秒内生效，又不会每条消息都查库
+        if self._settings is None or time.time() - self._settings_time > 3:
+            try:
+                self._settings = store.get_settings()
+                self._settings_time = time.time()
+            except Exception as e:
+                logger.warning(f"读取控制台配置失败，使用默认配置：{e}")
+                self._settings = dict(store.DEFAULT_SETTINGS)
+        return self._settings
+
+    def ai_enabled(self):
+        return bool(self.settings().get("ai_enabled", True))
+
+    def toggle_keywords(self):
+        return self.settings().get("toggle_keywords") or "。"
+
+    def manual_timeout_seconds(self):
+        return int(self.settings().get("manual_timeout_minutes") or 60) * 60
+
+    def fallback_reply(self):
+        return (self.settings().get("fallback_reply") or "").strip()
+
+    @staticmethod
+    def human_delay(text):
+        delay = random.uniform(*DELAY_BASE) + len(text or "") * random.uniform(*DELAY_PER_CHAR)
+        return min(delay, DELAY_MAX)
+
+    # ---------------- 规则 ----------------
+
+    def is_blacklisted(self, user_id):
+        try:
+            return rules.is_blacklisted(user_id)
+        except Exception as e:
+            logger.warning(f"检查黑名单失败：{e}")
+            return False
+
+    def keyword_reply(self, message, item_id):
+        try:
+            rule = rules.match_keyword(message, item_id)
+            return rule["reply"] if rule else None
+        except Exception as e:
+            logger.warning(f"匹配关键词失败：{e}")
+            return None
+
+    def away_reply(self, chat_id):
+        """
+        营业时间外的处理。
+        返回 None 表示营业中，正常回复；返回 "" 表示不回复；返回文本表示发送离线提示。
+        """
+        hours = self.settings().get("business_hours") or {}
+        if not hours.get("enabled"):
+            return None
+        now = time.strftime("%H:%M")
+        start, end = hours.get("start", "00:00"), hours.get("end", "23:59")
+        is_open = start <= now < end if start <= end else (now >= start or now < end)
+        if is_open:
+            return None
+        if hours.get("mode") != "away":
+            return ""
+        last = self._away_sent.get(chat_id, 0)
+        if time.time() - last < AWAY_REPLY_INTERVAL:
+            return ""
+        self._away_sent[chat_id] = time.time()
+        return hours.get("away_message") or ""
+
+    @staticmethod
+    def is_payment_message(message):
+        return bool(PAYMENT_PATTERN.search(message or ""))
+
+    def delivery_content(self, chat_id, item_id, item_title, buyer_id, buyer_name):
+        try:
+            content, rule, remaining = rules.take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name)
+        except Exception as e:
+            logger.error(f"自动发货出错：{e}")
+            return None
+        if rule and content is None and remaining == 0:
+            logger.warning(f"自动发货规则「{rule['name']}」卡密已用完")
+            self.event("stock", chat_id, f"规则「{rule['name']}」卡密已用完，买家 {buyer_name} 未能自动发货")
+            return None
+        if content and remaining is not None and remaining <= 3:
+            self.event("stock", chat_id, f"规则「{rule['name']}」卡密只剩 {remaining} 条")
+        return content
+
+    # ---------------- 事件 ----------------
+
+    def event(self, event_type, chat_id="", detail=""):
+        """记录统计并按配置推送通知（stock 只推送不计入统计）"""
+        try:
+            if event_type in store.EVENT_TYPES:
+                store.log_event(event_type, chat_id, detail)
+            if event_type in notify.NOTIFY_EVENTS:
+                notify.notify(event_type, notify.NOTIFY_EVENTS[event_type], detail)
+        except Exception as e:
+            logger.warning(f"记录事件失败：{e}")

@@ -3,15 +3,19 @@ from typing import List, Dict
 import os
 from openai import OpenAI
 from loguru import logger
+from console.llm import RoutedClient
 
 
 class XianyuReplyBot:
     def __init__(self):
-        # 初始化OpenAI客户端
-        self.client = OpenAI(
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        )
+        # 初始化模型客户端：优先使用控制台里配置的多模型路由，没有配置时回退到 .env 里的单个模型
+        fallback_client = None
+        if os.getenv("API_KEY"):
+            fallback_client = OpenAI(
+                api_key=os.getenv("API_KEY"),
+                base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            )
+        self.client = RoutedClient(fallback_client)
         self._init_system_prompts()
         self._init_agents()
         self.router = IntentRouter(self.agents['classify'])
@@ -74,6 +78,12 @@ class XianyuReplyBot:
 
     def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict]) -> str:
         """生成回复主流程"""
+        reply, intent = self.generate_reply_with_intent(user_msg, item_desc, context)
+        self.last_intent = intent
+        return reply
+
+    def generate_reply_with_intent(self, user_msg: str, item_desc: str, context: List[Dict]):
+        """生成回复并返回 (回复, 意图)，不修改共享状态，可以在多个线程里同时调用"""
         # 记录用户消息
         # logger.debug(f'用户所发消息: {user_msg}')
         
@@ -92,28 +102,28 @@ class XianyuReplyBot:
         if detected_intent == 'no_reply':
             # 无需回复的情况
             logger.info(f'意图识别完成: no_reply - 无需回复')
-            self.last_intent = 'no_reply'
-            return "-"  # 返回特殊标记，表示无需回复
+            return "-", 'no_reply'  # 返回特殊标记，表示无需回复
         elif detected_intent in self.agents and detected_intent not in internal_intents:
             agent = self.agents[detected_intent]
             logger.info(f'意图识别完成: {detected_intent}')
-            self.last_intent = detected_intent  # 保存当前意图
+            intent = detected_intent
         else:
             agent = self.agents['default']
             logger.info(f'意图识别完成: default')
-            self.last_intent = 'default'  # 保存当前意图
+            intent = 'default'
         
         # 3. 获取议价次数
         bargain_count = self._extract_bargain_count(context)
         logger.info(f'议价次数: {bargain_count}')
 
         # 4. 生成回复
-        return agent.generate(
+        reply = agent.generate(
             user_msg=user_msg,
             item_desc=item_desc,
             context=formatted_context,
             bargain_count=bargain_count
         )
+        return reply, intent
     
     def _extract_bargain_count(self, context: List[Dict]) -> int:
         """
