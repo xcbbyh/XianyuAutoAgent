@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import asyncio
 import time
 import os
@@ -70,6 +71,8 @@ class XianyuLive:
         self.ws_ready = False
         # 同意发送的回复一条一条发
         self.send_lock = asyncio.Lock()
+        # 发出去的消息 mid -> (会话, 时间)，用来核对闲鱼的回执
+        self.sent_mids = {}
 
     async def refresh_token(self):
         """刷新token"""
@@ -441,10 +444,13 @@ class XianyuLive:
             }
         }
         text_base64 = str(base64.b64encode(json.dumps(text).encode('utf-8')), 'utf-8')
+        mid = generate_mid()
+        # 记下这条消息的 mid：闲鱼对它的回执不是 200（被禁言、被限制）时要按风控处理
+        self.sent_mids[mid] = (cid, time.time())
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
-                "mid": generate_mid()
+                "mid": mid
             },
             "body": [
                 {
@@ -770,6 +776,9 @@ class XianyuLive:
             if (time.time() * 1000 - create_time) > self.message_expire_time:
                 logger.debug("过期消息丢弃")
                 return
+
+            if self.check_risk_notice(message, send_user_id, send_message):
+                return
                 
             # 获取商品ID和会话ID
             url_info = message["1"]["10"]["reminderUrl"]
@@ -839,6 +848,32 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"处理消息时发生错误: {str(e)}")
             logger.debug(f"原始消息: {message_data}")
+
+    def check_send_receipt(self, message_data):
+        try:
+            now = time.time()
+            for mid in [m for m, (_, at) in self.sent_mids.items() if now - at > 300]:
+                del self.sent_mids[mid]
+            mid = (message_data.get("headers") or {}).get("mid")
+            if mid not in self.sent_mids or "code" not in message_data:
+                return
+            cid, _ = self.sent_mids.pop(mid)
+            if str(message_data.get("code")) != "200":
+                detail = json.dumps(message_data, ensure_ascii=False)[:120]
+                logger.error(f"⛔ 闲鱼拒绝了发给会话 {cid} 的消息：{detail}")
+                safety.trip(f"闲鱼拒绝了发出的消息（{detail}），可能被禁言或限制")
+        except Exception as e:
+            logger.warning(f"核对发送回执失败: {e}")
+
+    def check_risk_notice(self, message, send_user_id, send_message):
+        """闲鱼系统发来的禁言/违规提醒：按风控信号处理（买家自己打的字不算）"""
+        system = (self.is_card_message(message) or self.is_system_message(message)
+                  or self.is_bracket_system_message(send_message) or not send_user_id)
+        if system and send_user_id != self.myid and re.search(r"禁言|违规|限制(发布|私聊|聊天|交易)", send_message or ""):
+            logger.error(f"⛔ 收到闲鱼系统提醒：{send_message}")
+            safety.trip(f"收到闲鱼系统提醒：{send_message[:60]}")
+            return True
+        return False
 
     async def send_heartbeat(self, ws):
         """发送心跳包并等待响应"""
@@ -942,6 +977,9 @@ class XianyuLive:
                                 break
                                 
                             message_data = json.loads(message)
+
+                            # 闲鱼对我们发出的消息的回执：不是 200 说明发送被拒（禁言、限制），所有自动功能停 24 小时
+                            self.check_send_receipt(message_data)
                             
                             # 处理心跳响应
                             if await self.handle_heartbeat_response(message_data):

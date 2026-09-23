@@ -296,6 +296,26 @@ class BotFlow(Base):
         self.assertEqual(len(self.live.ws.sent), 1)
         self.assertEqual(store.row("SELECT status FROM pending_replies WHERE id = ?", (rid,))["status"], "sent")
 
+    def test_rejected_send_receipt_trips_pause(self):
+        asyncio.run(self.live.send_msg(self.live.ws, "c1", "b1", "在的"))
+        mid = self.live.ws.sent[-1]["headers"]["mid"]
+        self.live.check_send_receipt({"code": 403, "headers": {"mid": mid}, "body": {"reason": "禁言"}})
+        self.assertTrue(safety.is_paused())
+
+    def test_ok_receipt_does_not_trip(self):
+        asyncio.run(self.live.send_msg(self.live.ws, "c1", "b1", "在的"))
+        mid = self.live.ws.sent[-1]["headers"]["mid"]
+        self.live.check_send_receipt({"code": 200, "headers": {"mid": mid}})
+        self.assertFalse(safety.is_paused())
+
+    def test_system_mute_notice_trips_but_buyer_text_does_not(self):
+        with mock.patch.object(self.live.xianyu, "get_item_info", return_value=self.item_api(MY_ID)):
+            self.run_message(self.live, self.main, chat_packet("2000", "你再不回我就举报你禁言", "560"))
+            self.assertFalse(safety.is_paused())
+            self.run_message(self.live, self.main,
+                             chat_packet("", "[你已被禁言，点此查看详情]", "560"))
+        self.assertTrue(safety.is_paused())
+
 
 if __name__ == "__main__":
     unittest.main()
