@@ -867,8 +867,8 @@ class XianyuLive:
 
     def check_risk_notice(self, message, send_user_id, send_message):
         """闲鱼系统发来的禁言/违规提醒：按风控信号处理（买家自己打的字不算）"""
-        system = (self.is_card_message(message) or self.is_system_message(message)
-                  or self.is_bracket_system_message(send_message) or not send_user_id)
+        # 只认卡片/系统消息或没有发送人的消息；买家打一句「[你已被禁言]」不能让机器人停 24 小时
+        system = self.is_card_message(message) or self.is_system_message(message) or not send_user_id
         if system and send_user_id != self.myid and re.search(r"禁言|违规|限制(发布|私聊|聊天|交易)", send_message or ""):
             logger.error(f"⛔ 收到闲鱼系统提醒：{send_message}")
             safety.trip(f"收到闲鱼系统提醒：{send_message[:60]}")
