@@ -1413,7 +1413,7 @@ PAGES.logs = async (el) => {
 /* ---------------- AI 模型 ---------------- */
 
 PAGES.models = async (el) => {
-  const { providers, categories } = await api("/api/providers");
+  const { providers, categories, ai_replies_today: aiToday } = await api("/api/providers");
   let filter = state.modelFilter || "all";
   const order = providers.filter((p) => p.enabled && p.key_count);
   // 已启用但最近一次测试失败的模型，在页面顶部明确提示
@@ -1432,6 +1432,9 @@ PAGES.models = async (el) => {
         ${order.length ? `<b>当前调用顺序（失败自动切换到下一个）</b><span>${order.map((p, i) => `${i + 1}. ${esc(p.name)}${p.key_count > 1 ? `（${p.key_count} 个 Key 轮换）` : ""}`).join(" → ")}</span>`
           : `<b>还没有可用的 AI 模型</b><span class="muted">选一个平台点「配置」，填入 API Key 并启用。推荐国内用户用通义千问或 DeepSeek。</span>`}
       </div></div>
+      <div class="banner good-note"><div class="grow"><b>💰 空闲时不调用 AI，不消耗额度</b>
+        <span class="muted">只有买家发来文字消息（且没命中关键词回复、不在黑名单、在营业时间内）、你用 AI 上架/AI 助手、或点「测试」时才会调用模型。
+        心跳、同步、擦亮、自动发货都不调用 AI。今天 AI 已回复买家 ${aiToday || 0} 次。</span></div></div>
       <div class="card-head" style="margin-bottom:12px">
         <div class="chips" style="margin:0">${[["all", "全部"], ["enabled", "已启用"], ...Object.entries(categories)].map(([k, v]) =>
           `<button class="chip ${filter === k ? "active" : ""}" data-filter="${k}">${v}</button>`).join("")}</div>
