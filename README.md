@@ -123,6 +123,7 @@ docker compose up -d --build
 - `data/` 目录挂载进容器，`console.db`、聊天记录、上传的图片和 `.env`（Cookie）都保存在这里，重建镜像不会丢。之前用 Docker 跑过旧版本的，把原来的 `.env` 移到 `data/.env` 即可。
 - `prompts/` 目录也挂载进容器，在控制台里改的提示词会保存在这里。
 - 端口只绑定宿主机的 `127.0.0.1`。部署在云服务器上时，用 SSH 隧道访问（`ssh -L 8765:127.0.0.1:8765 用户@服务器`），然后在自己电脑上打开 `http://127.0.0.1:8765`。
+- 「网页截图」和用浏览器读取闲鱼 Cookie 需要打开桌面浏览器窗口，Docker 里用不了，请在 Windows 本地运行控制台时使用；Docker 里在「闲鱼账号」页手动粘贴 Cookie 即可。
 - 更新代码后执行 `git pull && docker compose up -d --build`；查看日志用 `docker compose logs -f`。
 
 ### 自定义提示词
