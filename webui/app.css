@@ -261,6 +261,21 @@ td.actions .btn { margin-left: 6px; }
 .provider .meta .ok { color: var(--good); }
 .provider .meta .no { color: var(--bad); }
 .provider .ops { display: flex; gap: 8px; flex: none; }
+.provider { flex-wrap: wrap; }
+.key-chips { display: inline-flex; gap: 4px; }
+.key-chips .kc { min-width: 20px; height: 20px; padding: 0 5px; border-radius: 5px; display: inline-grid; place-items: center; font-size: 12px; font-weight: 600; }
+.key-chips .kc.good { background: var(--good-soft); color: var(--good); }
+.key-chips .kc.bad { background: var(--bad-soft); color: var(--bad); }
+.key-test { flex-basis: 100%; padding: 10px 14px; border-radius: 10px; font-size: 13px; line-height: 1.8; border: 1px solid var(--border); }
+.key-test.good { background: var(--good-soft); border-color: rgba(52, 211, 153, .3); }
+.key-test.warn { background: var(--warn-soft); border-color: rgba(251, 191, 36, .3); }
+.key-test.bad { background: var(--bad-soft); border-color: rgba(248, 113, 113, .3); }
+.key-test .kt-head { font-weight: 700; font-size: 14px; margin-bottom: 2px; }
+.key-test .kt-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
+.key-test .kt-row.good { color: var(--good); }
+.key-test .kt-row.bad { color: var(--bad); }
+.key-test .kt-err { font-size: 12px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.key-test .kt-reply { margin-top: 4px; font-size: 12.5px; }
 .key-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .key-row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 8px; background: #0e1218; border: 1px solid var(--border); }
 .key-row .mono { flex: 1; }

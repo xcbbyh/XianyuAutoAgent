@@ -1053,10 +1053,11 @@ PAGES.models = async (el) => {
       await run(() => api("/api/providers/default", { id: b.dataset.default }), "已设为默认模型"); navigate("models", true);
     }));
     $$("[data-test]", el).forEach((b) => (b.onclick = async () => {
-      b.disabled = true; b.textContent = "测试中…";
+      const p = providers.find((x) => x.id === b.dataset.test);
+      b.disabled = true; b.textContent = `测试中…（${p.key_count} 把 Key）`;
       try {
-        const r = await api("/api/providers/test", { id: b.dataset.test });
-        r.ok ? toast(`连接成功（${r.latency} 秒）：${r.reply}`) : toast("连接失败：" + r.error, "error");
+        const r = await api("/api/providers/test", { id: p.id });
+        r.ok ? toast(`${r.ok_count}/${r.total} 把 Key 可用`) : toast("全部 Key 都不可用：" + r.error, "error");
       } catch (e) { toast(e.message, "error"); }
       navigate("models", true);
     }));
@@ -1066,7 +1067,13 @@ PAGES.models = async (el) => {
 
 function providerCard(p) {
   const t = p.last_test;
-  const testBadge = t ? (t.ok ? `<span class="badge good">测试通过 ${t.latency}s</span>` : `<span class="badge bad" title="${esc(t.error)}">测试失败</span>`) : "";
+  const testBadge = !t ? "" : t.keys
+    ? `<span class="badge ${t.ok_count === t.total ? "good" : t.ok ? "warn" : "bad"}">测试 ${t.ok_count}/${t.total} 可用</span>`
+    : (t.ok ? `<span class="badge good">测试通过 ${t.latency}s</span>` : `<span class="badge bad" title="${esc(t.error)}">测试失败</span>`);
+  // 测试结果只对当时的 Key 有效：Key 数量变了就提示重新测试
+  const keyTest = t && t.keys && t.total === p.key_count ? t.keys : null;
+  const keyChips = keyTest ? `<span class="key-chips">${keyTest.map((k) =>
+    `<span class="kc ${k.ok ? "good" : "bad"}" title="${esc(k.ok ? "可用" : `${k.code || ""} ${k.hint}`)}">${k.index}</span>`).join("")}</span>` : "";
   return `
     <div class="provider ${p.enabled ? "on" : "off"}">
       <div class="pic">${esc(p.name.slice(0, 1))}</div>
@@ -1077,7 +1084,7 @@ function providerCard(p) {
           <span class="badge">${esc(p.category_label)}</span>${testBadge}</div>
         <div class="desc">${esc(p.description)}</div>
         <div class="meta"><span>模型：<span class="mono">${esc(p.model)}</span></span>
-          <span>API Key：${p.key_count ? `<span class="ok">✓ 已配置 ${p.key_count} 个</span>` : `<span class="no">✗ 未配置</span>`}</span>
+          <span>API Key：${p.key_count ? `<span class="ok">✓ 已配置 ${p.key_count} 个</span>` : `<span class="no">✗ 未配置</span>`}</span>${keyChips}
           ${p.supports_search ? `<span class="badge info">联网搜索</span>` : ""}<span class="muted">优先级 ${p.priority}</span></div>
       </div>
       <div class="ops">
@@ -1086,7 +1093,24 @@ function providerCard(p) {
         ${p.enabled && !p.is_default ? `<button class="btn sm" data-default="${p.id}">设为默认</button>` : ""}
         <button class="btn sm ${p.enabled ? "danger" : "teal"}" data-toggle="${p.id}">${p.enabled ? "停用" : "启用"}</button>
       </div>
+      ${t && t.keys ? keyTestPanel(t, p) : ""}
     </div>`;
+}
+
+function keyTestPanel(t, p) {
+  const tone = t.ok_count === t.total ? "good" : t.ok ? "warn" : "bad";
+  const when = new Date(t.time * 1000).toLocaleString("zh-CN", { hour12: false });
+  const stale = t.total !== p.key_count ? `<span class="muted">（Key 有变动，请重新测试）</span>` : "";
+  const rows = t.keys.map((k) => `
+    <div class="kt-row ${k.ok ? "good" : "bad"}"><span>${k.index} 号 <span class="mono">${esc(k.key)}</span> <span class="muted">(${k.length}位)</span> —</span>
+      ${k.ok ? `<b>✓ 可用</b> <span>(${k.ms}ms)</span>`
+        : `<b>✗ ${k.code ? k.code + " " : ""}${esc(k.hint)}</b> <span>(${k.ms}ms)</span> <span class="muted kt-err" title="${esc(k.error)}">${esc(k.error)}</span>`}
+    </div>`).join("");
+  const sample = t.reply ? `<div class="kt-reply muted">模型回复：${esc(t.reply)}</div>` : "";
+  return `<div class="key-test ${tone}">
+    <div class="kt-head">${t.ok_count}/${t.total} 把 Key 可用 · 模型 <span class="mono">${esc(t.model || p.model)}</span> <span class="muted">· 测于 ${when}</span>${stale}</div>
+    ${rows}${sample}
+  </div>`;
 }
 
 function configProvider(p) {
