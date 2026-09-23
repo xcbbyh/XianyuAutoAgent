@@ -23,6 +23,11 @@ def save_keyword(payload):
         raise ValueError("关键词和回复内容都不能为空")
     if match_type not in MATCH_TYPES:
         raise ValueError("匹配方式不正确")
+    from . import content_guard
+    problems = content_guard.banned_words(reply) + content_guard.ai_tone(reply)
+    if problems:
+        # 审核时这些话一定发不出去，保存时就提醒
+        raise ValueError("回复内容不符合闲鱼规则或不像真人说话：" + "、".join(problems))
     if match_type == "regex":
         try:
             re.compile(keyword)
@@ -96,6 +101,11 @@ def save_delivery_rule(payload):
         raise ValueError("请填写发货内容")
     if mode == "cards" and not stock:
         raise ValueError("请至少填写一条卡密")
+    from . import content_guard
+    words = content_guard.banned_words("\n".join([content, *stock]))
+    if words:
+        # 发货内容同样不能有站外联系方式（链接、网盘、微信等），审核时会被拦下
+        raise ValueError("发货内容或卡密里有闲鱼违规词：" + "、".join(words) + "，这类内容请你本人在闲鱼里处理")
     if payload.get("id") and mode == "cards":
         # 编辑期间可能已经发出了几条卡密，别把它们又加回库存
         sent = {r["content"] for r in store.rows("SELECT content FROM deliveries WHERE rule_id = ?",

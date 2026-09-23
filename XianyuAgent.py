@@ -285,9 +285,7 @@ class TechAgent(BaseAgent):
             temperature=0.4,
             max_tokens=500,
             top_p=0.8,
-            extra_body={
-                "enable_search": True,
-            }
+            # 不联网搜索：规则要求只按商品页写的内容回答，搜来的参数可能和你的商品对不上
         )
 
         return self.safety_filter(response.choices[0].message.content)
