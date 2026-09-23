@@ -341,6 +341,8 @@ async function refreshStatus() {
 }
 
 async function pollLogs() {
+  if (state.logBusy) return;
+  state.logBusy = true;
   try {
     const data = await api("/api/logs?since=" + state.logSeq);
     if (data.last < state.logSeq) { state.logSeq = 0; return; }
@@ -350,7 +352,7 @@ async function pollLogs() {
       if (state.logs.length > 5000) state.logs.splice(0, state.logs.length - 5000);
       if (state.page === "logs") appendLogLines(data.lines);
     }
-  } catch {}
+  } catch {} finally { state.logBusy = false; }
 }
 
 function startPolling() {
@@ -372,8 +374,8 @@ const PAGES = {};
 
 /* ---------------- 仪表盘 ---------------- */
 
-const EVENT_LABEL = { message: "买家消息", ai_reply: "AI 回复", keyword_reply: "关键词回复", away_reply: "离线回复", order: "买家付款", delivery: "自动发货", risk: "风控" };
-const EVENT_BADGE = { message: "info", ai_reply: "good", keyword_reply: "accent", away_reply: "", order: "warn", delivery: "good", risk: "bad" };
+const EVENT_LABEL = { message: "买家消息", ai_reply: "AI 回复", keyword_reply: "关键词回复", away_reply: "离线回复", order: "买家付款", delivery: "自动发货", risk: "风控", publish: "自动上架", polish: "擦亮" };
+const EVENT_BADGE = { message: "info", ai_reply: "good", keyword_reply: "accent", away_reply: "", order: "warn", delivery: "good", risk: "bad", publish: "good", polish: "" };
 
 PAGES.overview = async (el) => {
   const d = await api("/api/overview");
@@ -516,8 +518,8 @@ PAGES.keywords = async (el) => {
       ${switchHtml("enabled", r.id ? !!r.enabled : true, "启用")}`,
     onSubmit: async (d) => { await api("/api/keywords/save", { ...d, id: r.id }); toast("规则已保存"); navigate("keywords", true); },
   });
-  $("#addKw").onclick = () => edit({ item_id: state.prefillItem || "" });
-  state.prefillItem = null;
+  $("#addKw").onclick = () => edit({ item_id: "" });
+  if (state.prefillItem) { const item = state.prefillItem; state.prefillItem = null; edit({ item_id: item }); }
   $$("[data-edit]", el).forEach((b) => (b.onclick = () => edit(rules.find((r) => r.id == b.dataset.edit))));
   $$("[data-del]", el).forEach((b) => (b.onclick = () => confirmBox("确定删除这条关键词规则吗？", async () => {
     await api("/api/keywords/delete", { id: b.dataset.del }); toast("已删除"); navigate("keywords", true);
@@ -633,8 +635,8 @@ PAGES.delivery = async (el) => {
     m.form.elements.mode.onchange = sync;
     sync();
   };
-  $("#addRule").onclick = () => edit({ item_id: state.prefillItem || "" });
-  state.prefillItem = null;
+  $("#addRule").onclick = () => edit({ item_id: "" });
+  if (state.prefillItem) { const item = state.prefillItem; state.prefillItem = null; edit({ item_id: item }); }
   $$("[data-edit]", el).forEach((b) => (b.onclick = () => edit(rules.find((r) => r.id == b.dataset.edit))));
   $$("[data-del]", el).forEach((b) => (b.onclick = () => confirmBox("确定删除这条发货规则吗？剩余卡密也会一起删除。", async () => {
     await api("/api/delivery/delete", { id: b.dataset.del }); toast("已删除"); navigate("delivery", true);
@@ -781,8 +783,8 @@ function itemActions(itemId) {
     <button class="btn sm" data-kw="${esc(itemId)}">关键词</button><button class="btn sm" data-dl="${esc(itemId)}">发货规则</button>`;
 }
 function bindItemActions(root) {
-  $$("[data-kw]", root).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.kw; navigate("keywords"); setTimeout(() => $("#addKw")?.click(), 300); }));
-  $$("[data-dl]", root).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.dl; navigate("delivery"); setTimeout(() => $("#addRule")?.click(), 300); }));
+  $$("[data-kw]", root).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.kw; navigate("keywords"); }));
+  $$("[data-dl]", root).forEach((b) => (b.onclick = () => { state.prefillItem = b.dataset.dl; navigate("delivery"); }));
 }
 
 /* 后台任务进行中时，每 3 秒刷新一次任务进度，结束后刷新页面 */
@@ -853,6 +855,9 @@ function localInput(ts) {
 
 function editListing(l, choices) {
   let images = [...(l.images || [])];
+  // 排队中的商品编辑后默认继续排队，定时的保持定时
+  const defaultAction = l.id && l.status === "queued"
+    ? (l.scheduled_at && l.scheduled_at > Date.now() / 1000 + 60 ? "schedule" : "publish") : "draft";
   const m = modal({
     title: l.id ? "编辑商品" : "新建商品", wide: true, submitText: "确定",
     body: `
@@ -877,9 +882,9 @@ function editListing(l, choices) {
       </div>
       <div class="section-title">保存方式</div>
       <div style="margin-bottom:10px">
-        <label class="check"><input type="radio" name="action" value="draft" checked> 存为草稿</label>
-        <label class="check"><input type="radio" name="action" value="publish"> 加入上架队列（按防风控节奏尽快发布）</label>
-        <label class="check"><input type="radio" name="action" value="schedule"> 定时上架</label>
+        <label class="check"><input type="radio" name="action" value="draft" ${defaultAction === "draft" ? "checked" : ""}> 存为草稿</label>
+        <label class="check"><input type="radio" name="action" value="publish" ${defaultAction === "publish" ? "checked" : ""}> 加入上架队列（按防风控节奏尽快发布）</label>
+        <label class="check"><input type="radio" name="action" value="schedule" ${defaultAction === "schedule" ? "checked" : ""}> 定时上架</label>
       </div>
       <label class="field hidden" data-when><span>上架时间</span><input type="datetime-local" name="when" value="${localInput(l.scheduled_at)}"></label>`,
     onSubmit: async (f) => {

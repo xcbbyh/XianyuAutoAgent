@@ -121,9 +121,10 @@ def publish_block_reason():
     if in_quiet_hours():
         return "夜间静默时段"
     p = params()
-    if count_today("publish") >= p["publish_daily_limit"]:
-        return f"今天已达上架上限（{p['publish_daily_limit']} 个）"
-    last = store.row("SELECT MAX(created_at) AS t FROM events WHERE type = 'publish'")["t"]
+    # 按「尝试次数」计算，失败的上架也算，避免连续失败时频繁请求
+    if count_today("publish_attempt") >= p["publish_daily_limit"]:
+        return f"今天已达上架上限（{p['publish_daily_limit']} 次）"
+    last = store.row("SELECT MAX(created_at) AS t FROM events WHERE type = 'publish_attempt'")["t"]
     if last and time.time() - last < p["publish_interval_minutes"] * 60:
         return f"距离上次上架不足 {p['publish_interval_minutes']} 分钟"
     return None

@@ -307,3 +307,28 @@ class ChatContextManager:
             return 0
         finally:
             conn.close() 
+    def find_buyer_by_chat(self, session_id):
+        """
+        根据会话ID（或买家ID）找到最近一条买家消息对应的会话、买家和商品
+
+        Args:
+            session_id: 订单通知里带的会话ID，个别情况下是买家ID
+
+        Returns:
+            tuple: (chat_id, buyer_id, item_id)，找不到返回 None
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "SELECT chat_id, user_id, item_id FROM messages WHERE role = 'user' AND (chat_id = ? OR user_id = ?) "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id, session_id)
+            )
+            return cursor.fetchone()
+        except Exception as e:
+            logger.error(f"查询会话买家时出错: {e}")
+            return None
+        finally:
+            conn.close()

@@ -135,19 +135,43 @@ class BotHooks:
     def is_payment_message(message):
         return bool(PAYMENT_PATTERN.search(message or ""))
 
-    def delivery_content(self, chat_id, item_id, item_title, buyer_id, buyer_name):
+    def take_delivery(self, chat_id, item_id, item_title, buyer_id, buyer_name):
+        """取出这笔订单的发货内容；没有匹配规则、已发过或库存不足时返回 None"""
         try:
-            content, rule, remaining = rules.take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name)
+            content, rule, remaining, delivery_id, card = rules.take_delivery(
+                chat_id, item_id, item_title, buyer_id, buyer_name)
         except Exception as e:
             logger.error(f"自动发货出错：{e}")
             return None
         if rule and content is None and remaining == 0:
             logger.warning(f"自动发货规则「{rule['name']}」卡密已用完")
-            self.event("stock", chat_id, f"规则「{rule['name']}」卡密已用完，买家 {buyer_name} 未能自动发货")
+            self.event("stock", chat_id, f"规则「{rule['name']}」卡密已用完，买家 {buyer_name} 未能自动发货，请手动发货")
             return None
-        if content and remaining is not None and remaining <= 3:
+        if not content:
+            return None
+        if remaining is not None and remaining <= 3:
             self.event("stock", chat_id, f"规则「{rule['name']}」卡密只剩 {remaining} 条")
-        return content
+        return {"content": content, "rule_id": rule["id"], "rule_name": rule["name"],
+                "delivery_id": delivery_id, "card": card}
+
+    def rollback_delivery(self, delivery, buyer_name=""):
+        try:
+            rules.rollback_delivery(delivery["delivery_id"], delivery["rule_id"], delivery["card"])
+        except Exception as e:
+            logger.error(f"退回卡密失败：{e}")
+        notify.notify("delivery", "自动发货失败",
+                      f"给 {buyer_name} 的发货消息没有发出去（网络断开），卡密已退回库存，请手动发货")
+
+    @staticmethod
+    def is_new_order(chat_id, item_id):
+        """同一个订单的付款通知可能推送两次（订单状态 + 会话卡片），10 分钟内只记一次"""
+        try:
+            return store.row(
+                "SELECT id FROM events WHERE type = 'order' AND chat_id = ? AND created_at > ?",
+                (chat_id, time.time() - 600),
+            ) is None
+        except Exception:
+            return True
 
     # ---------------- 事件 ----------------
 
