@@ -135,6 +135,7 @@ function confirmBox(text, onOk, okText = "确定") {
 const ICON_PATHS = {
   overview: "M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z",
   reply: "M21 12a8 8 0 0 1-11.6 7.1L4 21l1.9-5.4A8 8 0 1 1 21 12z",
+  approvals: "M4 5h16v11H8l-4 4V5zM8.5 10.5l2 2 4-4",
   keywords: "M7 7h10M7 12h10M7 17h6M4 4h16v16H4z",
   prompts: "M4 19.5V5a2 2 0 0 1 2-2h14v16H6.5A2.5 2.5 0 0 0 4 21.5zM8 7h8M8 11h6",
   blacklist: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM5.6 5.6l12.8 12.8",
@@ -157,7 +158,7 @@ const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColo
 
 const NAV = [
   ["总览", [["overview", "仪表盘"]]],
-  ["客服中心", [["assistant", "AI 助手"], ["reply", "AI 自动回复"], ["keywords", "关键词回复"], ["prompts", "话术提示词"], ["blacklist", "黑名单"]]],
+  ["客服中心", [["approvals", "待审核回复"], ["assistant", "AI 助手"], ["reply", "AI 自动回复"], ["keywords", "关键词回复"], ["prompts", "话术提示词"], ["blacklist", "黑名单"]]],
   ["商品与交易", [["items", "商品管理"], ["listings", "自动上架"], ["screenshots", "网页截图"], ["delivery", "自动发货"]]],
   ["数据中心", [["chats", "对话记录"], ["logs", "运行日志"]]],
   ["接入配置", [["models", "AI 模型"], ["account", "闲鱼账号"], ["notify", "消息通知"]]],
@@ -166,10 +167,11 @@ const NAV = [
 ];
 const PAGE_SUB = {
   overview: "运行状态与今日数据",
+  approvals: "机器人想发给买家的每条消息都先放在这里，你点「同意发送」才会发出",
   assistant: "跟 AI 说需求，它帮你上架、擦亮、改规则（改动前要你确认）",
   reply: "AI 开关、人工接管、营业时间",
   keywords: "命中关键词时直接回复固定话术，优先于 AI",
-  prompts: "决定 AI 怎么说话、怎么议价",
+  prompts: "决定 AI 怎么说话、怎么议价（每个回复提示词后面都会自动加上「真人模式」规则：像本人打字、不推销、不暴露 AI）",
   blacklist: "黑名单买家的消息不回复、不通知",
   delivery: "买家付款后自动发送虚拟商品内容或卡密",
   items: "在售商品同步与自动擦亮",
@@ -326,6 +328,17 @@ function renderStatus(s) {
   $("#botStart").disabled = s.running;
   $("#botStop").disabled = !s.running;
   $("#botRestart").disabled = !s.running;
+  const navBtn = $('.nav button[data-page="approvals"]');
+  if (navBtn) {
+    let c = $(".count", navBtn);
+    if (!c) { c = document.createElement("span"); c.className = "count badge warn"; navBtn.appendChild(c); }
+    c.textContent = s.pending_replies || "";
+    c.style.display = s.pending_replies ? "" : "none";
+  }
+  if (state.page === "approvals" && s.pending_replies !== state.lastPending && approvalsIdle()) {
+    state.lastPending = s.pending_replies;
+    PAGES.approvals($("#page")).catch(() => {});
+  }
   const risk = $("#riskBanner");
   if (s.awaiting_cookie && !risk && $("#page")) {
     const div = document.createElement("div");
@@ -459,6 +472,12 @@ PAGES.reply = async (el) => {
       <div class="card">
         <div class="card-head"><h3>AI 自动回复</h3><span class="desc">改完点保存，几秒内生效，不用重启机器人</span></div>
         <div style="margin-bottom:18px">${switchHtml("ai_enabled", s.ai_enabled, "开启 AI 自动回复（关闭后只处理关键词回复和自动发货）")}</div>
+        <div class="banner warn" style="margin-bottom:14px"><div class="grow"><b>发送前需要我同意（建议全部开着）</b>
+          <div class="help">开着时机器人不会直接给买家发消息，只把写好的回复放进「待审核回复」，你点「同意发送」才发出去。
+          机器人只会处理你自己发布的商品的聊天；你去买别人东西的聊天，它一律不碰。</div></div></div>
+        <div style="margin-bottom:10px">${switchHtml("reply_approval", s.reply_approval, "AI 回复、离线提示、兜底话术发送前需要我同意")}</div>
+        <div style="margin-bottom:10px">${switchHtml("keyword_approval", s.keyword_approval, "关键词回复发送前需要我同意")}</div>
+        <div style="margin-bottom:18px">${switchHtml("delivery_approval", s.delivery_approval, "自动发货内容（卡密）发送前需要我同意")}</div>
         <div class="grid-2">
           <label class="field"><span>人工接管关键词</span><input type="text" name="toggle_keywords" value="${esc(s.toggle_keywords)}">
             <div class="help">你在闲鱼里对某个买家发送这个内容，该对话切换为人工回复；再发一次交还给 AI。</div></label>
@@ -486,8 +505,103 @@ PAGES.reply = async (el) => {
   trackDirty($("#replyForm"), (d) => api("/api/settings", {
     ai_enabled: d.ai_enabled, toggle_keywords: d.toggle_keywords, manual_timeout_minutes: Number(d.manual_timeout_minutes),
     fallback_reply: d.fallback_reply,
+    reply_approval: d.reply_approval, keyword_approval: d.keyword_approval, delivery_approval: d.delivery_approval,
     business_hours: { enabled: d.bh_enabled, start: d.bh_start, end: d.bh_end, mode: d.bh_mode, away_message: d.bh_away_message },
   }));
+};
+
+/* ---------------- 待审核回复 ---------------- */
+
+// 卖家正在改回复文字或弹窗打开时不刷新页面，免得改到一半被覆盖
+function approvalsIdle() {
+  const f = document.activeElement;
+  return !$(".modal-mask") && Date.now() - (state.editingReply || 0) > 15000 && !(f && f.tagName === "TEXTAREA");
+}
+const REPLY_STATUS_BADGE = { pending: "warn", approved: "info", sending: "info", sent: "good", rejected: "", failed: "bad" };
+
+PAGES.approvals = async (el) => {
+  const d = await api("/api/replies");
+  if (state.page !== "approvals") return;
+  state.lastPending = d.replies.filter((r) => r.status === "pending").length;
+  const pending = d.replies.filter((r) => r.status === "pending");
+  const others = d.replies.filter((r) => r.status !== "pending");
+  const off = [["reply_approval", "AI 回复"], ["keyword_approval", "关键词回复"], ["delivery_approval", "自动发货"]]
+    .filter(([k]) => !d.settings[k]).map(([, n]) => n);
+  const botOk = d.bot.running && d.bot.online;
+  el.innerHTML = `
+    <div class="banner ${off.length ? "bad" : "info"}"><div class="grow">
+      <b>${off.length ? `⚠️ 这些回复现在不用你同意就会直接发出：${off.join("、")}` : "🔒 机器人不会自己给买家发消息"}</b>
+      <div class="help">${off.length ? "如果要全部先审核，到「AI 自动回复」页面把「发送前需要我同意」的开关打开。" :
+        "买家发来消息后，机器人写好的回复先放在这里。你点「同意发送」才会发给买家，点「不发送」就丢掉。发送前可以改文字。"}
+        只处理你自己发布的商品的聊天，你是买家的聊天一律不碰。
+        发送前还会按闲鱼规则检查：敏感词（微信、全新、快递发货等）、AI 腔（提到 AI/机器人、客服腔、表情、列卖点、太长）、同一个聊天 2 分钟内只发一条、每小时最多 3 条、不发和之前几乎一样的话。
+        活体动物等敏感商品、问「你是AI吗」、只回「啥」「？」的聊天，机器人不写回复，会提醒你本人去回。</div></div>
+      ${off.length ? `<button class="btn" data-go="reply">去打开</button>` : ""}</div>
+    ${!botOk && d.replies.some((r) => r.status === "approved") ? `<div class="banner warn"><div class="grow"><b>机器人没有在线</b>
+      <div class="help">已同意的回复要等机器人启动并连上闲鱼后才会发出。</div></div></div>` : ""}
+    <div class="card">
+      <div class="card-head"><h3>等你审核（${pending.length}）</h3><span class="desc">页面每几秒自动刷新</span>
+        ${pending.length > 1 ? `<div class="actions"><button class="btn danger" id="rejectAll">全部不发送</button></div>` : ""}</div>
+      ${pending.length ? pending.map((r) => `
+        <div class="check-item" style="align-items:flex-start;flex-wrap:wrap;gap:10px" data-row="${r.id}">
+          <div class="grow" style="min-width:260px">
+            <div><b>${esc(r.buyer_name || "买家")}</b> <span class="badge accent">${esc(r.kind_label)}</span>
+              <span class="muted">· ${esc(r.item_title || "商品 " + r.item_id)} · ${ago(r.created_at)}</span></div>
+            <div style="margin:6px 0"><span class="muted">买家说：</span>${esc(r.buyer_message)}</div>
+            ${r.kind === "delivery" ? `<div class="help">发货内容（卡密已预留，点「不发送」会退回库存）：</div><pre class="mono" style="white-space:pre-wrap;margin:4px 0">${esc(r.reply)}</pre>`
+              : `<label class="field" style="margin:0"><span>准备回复（可以先改再发）</span><textarea rows="2" data-text="${r.id}">${esc(r.reply)}</textarea></label>`}
+          </div>
+          ${r.problems.length ? `<div class="banner bad" style="width:100%;margin:0"><div class="grow"><b>暂时不能发：</b>
+            ${r.problems.map((p) => `<div class="help">· ${esc(p)}</div>`).join("")}</div></div>` : ""}
+          <div class="actions" style="align-self:center">
+            <button class="btn primary" data-approve="${r.id}">同意发送</button>
+            <button class="btn" data-reject="${r.id}">不发送</button>
+          </div>
+        </div>`).join("") : emptyHtml("没有等待审核的回复。")}
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>最近处理过的</h3></div>
+      ${others.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>时间</th><th>买家</th><th>类型</th><th>买家说</th><th>回复</th><th>状态</th><th></th></tr></thead>
+        <tbody>${others.map((r) => `<tr>
+          <td>${fmtTs(r.updated_at)}</td><td>${esc(r.buyer_name || "买家")}</td><td>${esc(r.kind_label)}</td>
+          <td><div class="clip" title="${esc(r.buyer_message)}">${esc(r.buyer_message)}</div></td>
+          <td><div class="clip" title="${esc(r.kind === "delivery" ? "（发货内容）" : r.reply)}">${esc(r.kind === "delivery" ? "（发货内容）" : r.reply)}</div></td>
+          <td><span class="badge ${REPLY_STATUS_BADGE[r.status] || ""}" ${r.error ? `title="${esc(r.error)}"` : ""}>${esc(r.status_label)}</span>
+            ${r.error ? `<div class="help">${esc(r.error)}</div>` : ""}</td>
+          <td class="actions">${r.status === "failed" && r.kind !== "delivery" ? `<button class="btn sm" data-approve="${r.id}">重新发送</button>` : ""}
+            ${r.status === "approved" ? `<button class="btn sm" data-reject="${r.id}">取消发送</button>` : ""}</td>
+        </tr>`).join("")}</tbody></table></div>` : emptyHtml("还没有记录。")}
+    </div>`;
+  $$("[data-go]", el).forEach((b) => (b.onclick = () => navigate(b.dataset.go)));
+  const reload = () => { refreshStatus(); if (state.page === "approvals") PAGES.approvals(el); };
+  $$("[data-approve]", el).forEach((b) => (b.onclick = async () => {
+    const box = $(`[data-text="${b.dataset.approve}"]`, el);
+    b.disabled = true;
+    try {
+      await run(() => api("/api/replies/approve", { id: Number(b.dataset.approve), text: box ? box.value : null }),
+        botOk ? "已同意，马上发送" : "已同意，机器人上线后发送");
+    } catch { b.disabled = false; return; }
+    reload();
+  }));
+  $$("[data-reject]", el).forEach((b) => (b.onclick = async () => {
+    b.disabled = true;
+    try { await run(() => api("/api/replies/reject", { id: Number(b.dataset.reject) }), "已取消，不会发给买家"); }
+    catch { b.disabled = false; return; }
+    reload();
+  }));
+  const all = $("#rejectAll", el);
+  if (all) all.onclick = () => confirmBox(`确定这 ${pending.length} 条回复全部不发送吗？`, async () => {
+    await run(() => api("/api/replies/reject_all", {}), "已全部取消");
+    reload();
+  }, "全部不发送");
+  el.oninput = () => { state.editingReply = Date.now(); };
+  clearInterval(state.pagePoll);
+  state.pagePoll = setInterval(() => {
+    if (state.page !== "approvals") return clearInterval(state.pagePoll);
+    if (!approvalsIdle()) return;
+    if (d.replies.some((r) => r.status === "approved" || r.status === "sending")) PAGES.approvals(el).catch(() => {});
+  }, 3000);
 };
 
 /* ---------------- 关键词回复 ---------------- */

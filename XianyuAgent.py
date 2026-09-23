@@ -4,6 +4,7 @@ import os
 from openai import OpenAI
 from loguru import logger
 from console.llm import RoutedClient
+from console.content_guard import HUMAN_STYLE_PROMPT
 
 
 class XianyuReplyBot:
@@ -59,6 +60,11 @@ class XianyuReplyBot:
             self.tech_prompt = load_prompt_content("tech_prompt")
             # 加载默认提示词
             self.default_prompt = load_prompt_content("default_prompt")
+
+            # 真人模式：不管提示词有没有被改过，回复类提示词末尾都加上这段（意图识别不加）
+            self.price_prompt += HUMAN_STYLE_PROMPT
+            self.tech_prompt += HUMAN_STYLE_PROMPT
+            self.default_prompt += HUMAN_STYLE_PROMPT
                 
             logger.info("成功加载所有提示词")
         except Exception as e:
@@ -66,9 +72,11 @@ class XianyuReplyBot:
             raise
 
     def _safe_filter(self, text: str) -> str:
-        """安全过滤模块"""
-        blocked_phrases = ["微信", "QQ", "支付宝", "银行卡", "线下"]
-        return "[安全提醒]请通过平台沟通" if any(p in text for p in blocked_phrases) else text
+        """
+        安全过滤模块：原来命中敏感词会把回复换成「[安全提醒]请通过平台沟通」再发给买家，很像机器人。
+        现在所有回复都要先经过控制台的安全检查（console/content_guard.py），命中敏感词不能发送，这里只去掉首尾空白。
+        """
+        return (text or "").strip()
 
     def format_history(self, context: List[Dict]) -> str:
         """格式化对话历史，返回完整的对话记录"""

@@ -11,7 +11,7 @@ import time
 
 from loguru import logger
 
-from . import notify, rules, safety, store
+from . import approvals, content_guard, notify, rules, safety, store
 
 # 付款后闲鱼会在会话里推送这类系统卡片
 PAYMENT_PATTERN = re.compile(r"我已付款|已付款.{0,4}(待|等待).{0,2}发货|等待你发货|等待卖家发货")
@@ -31,6 +31,7 @@ class BotHooks:
         self._settings_time = 0
         self._away_sent = {}
         self._throttled = {}
+        self._human_notified = {}
 
     def settings(self):
         # 缓存 3 秒：控制台改完配置几秒内生效，又不会每条消息都查库
@@ -92,6 +93,59 @@ class BotHooks:
             notify.notify("message", "买家消息过多，已暂停自动回复",
                           f"{buyer_name or chat_id} 一小时内已自动回复 {count} 条，达到防风控上限，请人工查看")
         return False
+
+    # ---------------- 发送前审核 ----------------
+
+    def needs_approval(self, kind):
+        """
+        这类回复发送前是否需要卖家同意。默认需要；读取配置出错时也按「需要」处理，宁可不发。
+        每次都直接读数据库，不用缓存：卖家刚改的开关立刻生效。
+        """
+        key = approvals.SETTING_OF_KIND.get(kind, "reply_approval")
+        try:
+            return store.get_settings().get(key, True) is not False
+        except Exception as e:
+            logger.warning(f"读取审核开关失败，按需要审核处理：{e}")
+            return True
+
+    def queue_reply(self, kind, chat_id, buyer_id, buyer_name, item_id, item_title, buyer_message, reply,
+                    delivery=None):
+        """放进「待审核回复」并推送通知（不会发给买家）"""
+        approvals.queue(kind, chat_id, buyer_id, buyer_name, item_id, item_title, buyer_message, reply, delivery)
+        try:
+            title = "买家已付款，发货内容等你审核" if kind == "delivery" else "有一条回复等你审核"
+            text = (f"{buyer_name or '买家'}（商品 {item_title or item_id}）" if kind == "delivery"
+                    else f"{buyer_name or '买家'}：{buyer_message}\n准备回复：{reply}")
+            notify.notify("message", title, text + "\n请到控制台「待审核回复」点「同意发送」或「不发送」")
+        except Exception as e:
+            logger.warning(f"推送审核通知失败：{e}")
+
+    def need_human(self, chat_id, buyer_name, message, reason):
+        """机器人不回的聊天：记日志并提醒卖家本人去闲鱼里回复（同一个聊天 1 小时内只提醒一次）"""
+        if time.time() - self._human_notified.get(chat_id, 0) < 3600:
+            return
+        self._human_notified[chat_id] = time.time()
+        try:
+            notify.notify("message", "这条消息需要你本人回复", f"{buyer_name or '买家'}：{message}\n原因：{reason}")
+        except Exception as e:
+            logger.warning(f"推送提醒失败：{e}")
+
+    @staticmethod
+    def check_reply(chat_id, text, item_title="", kind="ai"):
+        try:
+            return content_guard.check_reply(chat_id, text, item_title, kind)
+        except Exception as e:
+            return [f"安全检查出错：{e}"]
+
+    @staticmethod
+    def is_known_own_item(item_id):
+        """控制台同步过的「我的商品」或自己上架成功的商品，一定是自己发布的"""
+        try:
+            return bool(store.row("SELECT item_id FROM my_items WHERE item_id = ?", (str(item_id),)) or
+                        store.row("SELECT id FROM listings WHERE item_id = ? AND item_id != ''", (str(item_id),)))
+        except Exception as e:
+            logger.warning(f"查询我的商品失败：{e}")
+            return False
 
     # ---------------- 规则 ----------------
 

@@ -15,6 +15,7 @@ from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, gener
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from console.hooks import BotHooks
+from console import approvals, content_guard
 
 # Docker 里通过 ENV_FILE 把 .env 放进 data 目录，本地运行仍用当前目录的 .env
 ENV_PATH = os.getenv("ENV_FILE") or ".env"
@@ -65,6 +66,8 @@ class XianyuLive:
         self.recent_sent = defaultdict(lambda: deque(maxlen=30))
         # 会话 -> (买家ID, 买家昵称, 商品ID)
         self.chat_meta = {}
+        # 当前连接是否可以发消息（「待审核回复」里同意发送的消息要等连接好了再发）
+        self.ws_ready = False
 
     async def refresh_token(self):
         """刷新token"""
@@ -134,13 +137,21 @@ class XianyuLive:
             record_user()
             return
 
+        # 按闲鱼规则，这些聊天机器人不起草回复，交给你本人：活体动物等敏感商品、问「你是AI吗」、看不懂的「啥」「？」
+        item_info = await asyncio.to_thread(self.get_item_info_cached, item_id)
+        skip = content_guard.skip_reason(text, (item_info or {}).get("title", ""), (item_info or {}).get("desc", ""))
+        if skip:
+            logger.info(f"✋ {skip}（买家 {buyer_name}：{text}）")
+            record_user()
+            self.hooks.need_human(chat_id, buyer_name, text, skip)
+            return
+
         # 关键词回复优先于 AI
         keyword_reply = self.hooks.keyword_reply(text, item_id)
         if keyword_reply:
             logger.info(f"🔑 命中关键词回复: {keyword_reply}")
             record_user()
-            await self.send_reply(chat_id, buyer_id, item_id, keyword_reply)
-            self.hooks.event("keyword_reply", chat_id, keyword_reply)
+            await self.send_or_queue("keyword", chat_id, item_id, buyer_id, buyer_name, text, keyword_reply)
             return
 
         # AI 总开关关闭，或者不在营业时间
@@ -153,8 +164,7 @@ class XianyuLive:
             record_user()
             if away:
                 logger.info("🌙 非营业时间，发送离线提示")
-                await self.send_reply(chat_id, buyer_id, item_id, away)
-                self.hooks.event("away_reply", chat_id, away)
+                await self.send_or_queue("away", chat_id, item_id, buyer_id, buyer_name, text, away)
             else:
                 logger.info("🌙 非营业时间，不回复")
             return
@@ -170,9 +180,11 @@ class XianyuLive:
         # 生成回复：放到线程里执行，调用大模型时不阻塞其他买家的消息和心跳
         try:
             bot_reply, intent = await asyncio.to_thread(bot.generate_reply_with_intent, text, item_description, context)
+            reply_kind = "ai"
         except Exception as e:
             logger.error(f"AI 生成回复失败: {e}")
             bot_reply, intent = self.hooks.fallback_reply(), "default"
+            reply_kind = "fallback"
             if not bot_reply:
                 record_user()
                 return
@@ -197,19 +209,53 @@ class XianyuLive:
             logger.info(f"🔴 会话 {chat_id} 在生成回复期间被人工接管，不发送 AI 回复")
             return
 
+        bot_reply = content_guard.humanize(bot_reply)
+        if not bot_reply:
+            return
         logger.info(f"机器人回复: {bot_reply}")
-        await self.send_reply(chat_id, buyer_id, item_id, bot_reply)
-        self.hooks.event("ai_reply", chat_id, bot_reply)
+        await self.send_or_queue(reply_kind, chat_id, item_id, buyer_id, buyer_name, text, bot_reply)
+
+    def item_title(self, item_id):
+        try:
+            return (self.context_manager.get_item_info(item_id) or {}).get("title", "") or ""
+        except Exception:
+            return ""
+
+    async def send_or_queue(self, kind, chat_id, item_id, buyer_id, buyer_name, buyer_message, text):
+        """
+        默认不直接发：放进控制台「待审核回复」，卖家点「同意发送」后才发出。
+        只有卖家在控制台明确关掉对应的「发送前需要我同意」开关，才直接发送。
+        """
+        problems = [] if self.hooks.needs_approval(kind) else self.hooks.check_reply(chat_id, text, self.item_title(item_id), kind)
+        if problems:
+            logger.warning(f"⚠️ 这条回复没通过安全检查，改为放进「待审核回复」: {'；'.join(problems)}")
+        if problems or self.hooks.needs_approval(kind):
+            self.hooks.queue_reply(kind, chat_id, buyer_id, buyer_name, item_id, self.item_title(item_id),
+                                   buyer_message, text)
+            logger.info(f"📝 回复没有发出，已放进控制台「待审核回复」，等你点「同意发送」: {text}")
+            return
+        await self.send_reply(chat_id, buyer_id, item_id, text)
+        self.hooks.event(approvals.EVENT_OF_KIND[kind], chat_id, text)
 
     async def handle_paid_order(self, chat_id, item_id, buyer_id, buyer_name):
         """买家已付款：按自动发货规则发送内容（人工接管时也照常发货）"""
         async with self.chat_locks[chat_id]:
+            # 你是买家的订单（你付款买别人的东西）绝对不能发货
+            if not await self.is_my_item(item_id):
+                logger.info(f"🛒 订单商品 {item_id} 不是你发布的（你是买家），不处理自动发货")
+                return
             if self.hooks.is_new_order(chat_id, item_id):
                 self.hooks.event("order", chat_id, f"{buyer_name} 已付款（商品 {item_id}）")
             item_info = await asyncio.to_thread(self.get_item_info_cached, item_id)
             item_title = (item_info or {}).get("title", "")
             delivery = self.hooks.take_delivery(chat_id, item_id, item_title, buyer_id, buyer_name)
             if not delivery:
+                return
+            if self.hooks.needs_approval("delivery"):
+                # 卡密已经预留，同意后发出；点「不发送」会退回库存
+                self.hooks.queue_reply("delivery", chat_id, buyer_id, buyer_name, item_id, item_title,
+                                       "（买家已付款）", delivery["content"], delivery=delivery)
+                logger.info(f"📝 {buyer_name} 已付款，发货内容已放进「待审核回复」，等你点「同意发送」")
                 return
             logger.info(f"📦 自动发货给 {buyer_name}（商品 {item_id}）")
             try:
@@ -289,19 +335,85 @@ class XianyuLive:
         self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", text)
 
     def get_item_info_cached(self, item_id):
-        """从数据库获取商品信息，如果不存在则从API获取并保存（同步方法，请在线程里调用）"""
+        """
+        从数据库获取商品信息，如果不存在则从API获取并保存（同步方法，请在线程里调用）。
+        保存时额外记下商品的卖家 ID（_seller_id），用来判断这个商品是不是自己发布的；
+        旧版本缓存里没有卖家 ID 的，重新从 API 取一次。
+        """
         item_info = self.context_manager.get_item_info(item_id)
-        if item_info:
+        if item_info and "_seller_id" in item_info:
             logger.info(f"从数据库获取商品信息: {item_id}")
             return item_info
         logger.info(f"从API获取商品信息: {item_id}")
-        api_result = self.xianyu.get_item_info(item_id)
-        if 'data' in api_result and 'itemDO' in api_result['data']:
-            item_info = api_result['data']['itemDO']
+        try:
+            api_result = self.xianyu.get_item_info(item_id)
+        except Exception as e:
+            api_result = {"error": str(e)}
+        data = api_result.get('data') if isinstance(api_result, dict) else None
+        if isinstance(data, dict) and isinstance(data.get('itemDO'), dict):
+            item_info = dict(data['itemDO'])
+            item_info['_seller_id'] = self.extract_seller_id(data)
             self.context_manager.save_item_info(item_id, item_info)
             return item_info
         logger.warning(f"获取商品信息失败: {api_result}")
-        return None
+        return item_info
+
+    @staticmethod
+    def extract_seller_id(data):
+        """从商品详情接口的返回里找出卖家 ID"""
+        seller = data.get('sellerDO') or {}
+        item = data.get('itemDO') or {}
+        for value in (seller.get('sellerId'), seller.get('userId'), item.get('sellerId'), item.get('userId'),
+                      (item.get('trackParams') or {}).get('sellerId')):
+            if value:
+                return str(value)
+        return ""
+
+    async def is_my_item(self, item_id):
+        """
+        这个商品是不是我（当前登录的账号）发布的。
+        我去问别人买东西时，聊天里的「对方」其实是卖家，这种会话绝对不能自动回复。
+        查不到卖家时按「不是我的」处理，宁可不回复也不能替买家身份乱说话。
+        """
+        if self.hooks.is_known_own_item(item_id):
+            return True
+        item_info = await asyncio.to_thread(self.get_item_info_cached, item_id)
+        seller_id = str((item_info or {}).get("_seller_id") or "")
+        if not seller_id:
+            logger.warning(f"⚠️ 查不到商品 {item_id} 的卖家，无法确认是不是你发布的，为安全起见不自动回复")
+            return False
+        return seller_id == str(self.myid)
+
+    async def send_approved(self, r):
+        """发送控制台里点了「同意发送」的回复"""
+        chat_id = r["chat_id"]
+        async with self.chat_locks[chat_id]:
+            try:
+                await self.send_reply(chat_id, r["buyer_id"], r["item_id"], r["reply"])
+            except Exception as e:
+                logger.error(f"同意发送的回复没有发出去: {e}")
+                await asyncio.to_thread(approvals.mark_failed, r, e)
+                return
+            await asyncio.to_thread(approvals.mark_sent, r["id"])
+            logger.info(f"✅ 已发送你同意的回复（会话 {chat_id}）: {r['reply']}")
+            if r["kind"] == "delivery":
+                self.hooks.event("delivery", chat_id,
+                                 f"已给 {r['buyer_name'] or '买家'} 发货（商品 {r['item_title'] or r['item_id']}）")
+            else:
+                self.hooks.event(approvals.EVENT_OF_KIND.get(r["kind"], "ai_reply"), chat_id, r["reply"])
+
+    async def approved_sender_loop(self):
+        """每 2 秒看一下控制台有没有新同意发送的回复（只在连接正常时发送）"""
+        while True:
+            try:
+                if self.ws_ready and self.ws is not None:
+                    for r in await asyncio.to_thread(approvals.claim_approved):
+                        task = asyncio.create_task(self.send_approved(r))
+                        self.message_tasks.add(task)
+                        task.add_done_callback(self.message_tasks.discard)
+            except Exception as e:
+                logger.error(f"检查待发送回复失败: {e}")
+            await asyncio.sleep(2)
 
     async def send_msg(self, ws, cid, toid, text):
         text = {
@@ -671,6 +783,11 @@ class XianyuLive:
                 logger.info(f"卖家人工回复 (会话: {chat_id}, 商品: {item_id}): {send_message}")
                 return
 
+            # 只处理自己发布的商品的聊天：如果这个商品是别人的，说明你在这个会话里是买家，对方是卖家，绝对不能自动回复
+            if not await self.is_my_item(item_id):
+                logger.info(f"🛒 商品 {item_id} 不是你发布的（这个会话里你是买家，{send_user_name} 是卖家），跳过，不自动回复")
+                return
+
             logger.info(f"用户: {send_user_name} (ID: {send_user_id}), 商品: {item_id}, 会话: {chat_id}, 消息: {send_message}")
             # 记住会话对应的买家和商品，订单状态通知只带会话 ID 时要用
             self.chat_meta[chat_id] = (send_user_id, send_user_name, item_id)
@@ -761,6 +878,12 @@ class XianyuLive:
         return False
 
     async def main(self):
+        # 上次关闭时正在发送的回复，不确定有没有发出，标记为失败让卖家确认
+        try:
+            approvals.recover_sending()
+        except Exception as e:
+            logger.error(f"恢复待发送回复失败: {e}")
+        self.sender_task = asyncio.create_task(self.approved_sender_loop())
         while True:
             try:
                 # 重置连接重启标志
@@ -791,6 +914,7 @@ class XianyuLive:
                     
                     # 启动token刷新任务
                     self.token_refresh_task = asyncio.create_task(self.token_refresh_loop())
+                    self.ws_ready = True
                     
                     async for message in websocket:
                         try:
@@ -838,6 +962,7 @@ class XianyuLive:
                 logger.error(f"连接发生错误: {e}")
                 
             finally:
+                self.ws_ready = False
                 # 清理任务
                 if self.heartbeat_task:
                     self.heartbeat_task.cancel()
