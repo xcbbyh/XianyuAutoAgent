@@ -56,7 +56,7 @@
 ### 安装步骤
 ```bash
 1. 克隆仓库
-git clone https://github.com/shaxiu/XianyuAutoAgent.git
+git clone https://github.com/xcbbyh/XianyuAutoAgent.git
 cd XianyuAutoAgent
 
 2. 安装依赖
@@ -108,6 +108,23 @@ python main.py
 - 擦亮、上架由控制台后台执行，需要保持控制台运行；自动化只能降低风险，无法保证不被平台识别，请遵守闲鱼规则。
 - 大部分配置保存后几秒内生效；修改提示词、Cookie 后需要点「重启」。
 - 使用控制台后，人工接管关键词等设置以控制台为准，`.env` 里的 `TOGGLE_KEYWORDS`、`SIMULATE_HUMAN_TYPING` 不再使用；未在控制台配置模型时仍使用 `.env` 里的模型。
+
+### Docker 部署（控制台）
+
+```bash
+git clone https://github.com/xcbbyh/XianyuAutoAgent.git
+cd XianyuAutoAgent
+docker compose up -d --build
+```
+
+启动后在本机浏览器打开 `http://127.0.0.1:8765`，和本地运行一样先注册管理员账号，再在控制台里填模型和 Cookie，不需要事先准备 `.env`。
+
+- 镜像用本仓库代码在本地构建，容器启动的是控制台，机器人由控制台启动、停止和自动重启。
+- `data/` 目录挂载进容器，`console.db`、聊天记录、上传的图片和 `.env`（Cookie）都保存在这里，重建镜像不会丢。之前用 Docker 跑过旧版本的，把原来的 `.env` 移到 `data/.env` 即可。
+- `prompts/` 目录也挂载进容器，在控制台里改的提示词会保存在这里。
+- 端口只绑定宿主机的 `127.0.0.1`。部署在云服务器上时，用 SSH 隧道访问（`ssh -L 8765:127.0.0.1:8765 用户@服务器`），然后在自己电脑上打开 `http://127.0.0.1:8765`。
+- 「网页截图」和用浏览器读取闲鱼 Cookie 需要打开桌面浏览器窗口，Docker 里用不了，请在 Windows 本地运行控制台时使用；Docker 里在「闲鱼账号」页手动粘贴 Cookie 即可。
+- 更新代码后执行 `git pull && docker compose up -d --build`；查看日志用 `docker compose logs -f`。
 
 ### 自定义提示词
 

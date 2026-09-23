@@ -16,6 +16,9 @@ from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from console.hooks import BotHooks
 
+# Docker 里通过 ENV_FILE 把 .env 放进 data 目录，本地运行仍用当前目录的 .env
+ENV_PATH = os.getenv("ENV_FILE") or ".env"
+
 
 class XianyuLive:
     def __init__(self, cookies_str):
@@ -867,7 +870,7 @@ def check_and_complete_env():
         "COOKIES_STR": "your_cookies_here"
     }
     
-    env_path = ".env"
+    env_path = ENV_PATH
     updated = False
     
     for key, placeholder in critical_vars.items():
@@ -903,8 +906,8 @@ def check_and_complete_env():
 
 if __name__ == '__main__':
     # 加载环境变量
-    if os.path.exists(".env"):
-        load_dotenv()
+    if os.path.exists(ENV_PATH):
+        load_dotenv(ENV_PATH)
         logger.info("已加载 .env 配置")
     
     if os.path.exists(".env.example"):

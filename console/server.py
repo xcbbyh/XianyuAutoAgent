@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -23,7 +24,7 @@ from dotenv import dotenv_values, set_key
 from . import auth, browser, notify, providers, rules, safety, shop, store
 
 BASE_DIR = store.BASE_DIR
-ENV_PATH = os.path.join(BASE_DIR, ".env")
+ENV_PATH = store.ENV_PATH
 ENV_EXAMPLE_PATH = os.path.join(BASE_DIR, ".env.example")
 PROMPT_DIR = os.path.join(BASE_DIR, "prompts")
 STATIC_DIR = os.path.join(BASE_DIR, "webui")
@@ -33,7 +34,8 @@ STATIC_FILES = {
     "/app.css": ("app.css", "text/css; charset=utf-8"),
 }
 
-HOST = "127.0.0.1"
+# Docker 里需要 WEBUI_HOST=0.0.0.0 才能从宿主机访问，端口映射只绑定宿主机的 127.0.0.1
+HOST = os.getenv("WEBUI_HOST", "127.0.0.1")
 PORT = int(os.getenv("WEBUI_PORT", "8765"))
 SESSION_COOKIE = "xy_session"
 
@@ -674,10 +676,14 @@ class Handler(BaseHTTPRequestHandler):
             "Set-Cookie": f"{SESSION_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict"})
 
 
+def _on_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
     ensure_env_file()
     providers.ensure_presets()
-    url = f"http://{HOST}:{PORT}"
+    url = f"http://{'127.0.0.1' if HOST in ('0.0.0.0', '::') else HOST}:{PORT}"
     try:
         server = ThreadingHTTPServer((HOST, PORT), Handler)
     except OSError:
@@ -685,6 +691,8 @@ def main():
         webbrowser.open(url)
         return
     atexit.register(bot.stop)
+    # docker stop 发的是 SIGTERM，转成 KeyboardInterrupt 走下面的 finally，先停掉机器人再退出
+    signal.signal(signal.SIGTERM, _on_sigterm)
     print("=" * 56)
     print(f" 闲鱼 AutoAgent 控制台已启动：{url}")
     print(" 请在浏览器里操作；这个窗口不要关（关掉机器人也会停）")
