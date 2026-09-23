@@ -415,3 +415,22 @@ input[type=datetime-local] {
 .ai-fields .muted { font-weight: 400; margin-left: 8px; font-size: 12.5px; }
 .ai-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 @media (max-width: 1100px) { .ai-shop-body { grid-template-columns: 1fr; } }
+
+/* ---------- AI 助手 ---------- */
+.as-chat { min-height: 560px; margin-bottom: 10px; }
+.as-chat .ai-msgs { max-height: 62vh; }
+.ai-msg.bad { border-color: rgba(248, 113, 113, .4); color: var(--bad); }
+.as-tips { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 14px 10px; }
+.as-tips:empty { display: none; }
+.as-action { align-self: stretch; border: 1px solid rgba(255, 197, 61, .4); background: var(--accent-soft); border-radius: 12px; padding: 10px 14px; font-size: 13.5px; }
+.as-action.done { border-color: rgba(52, 211, 153, .35); background: var(--good-soft); }
+.as-action.cancelled { opacity: .6; background: var(--panel-2); border-color: var(--border); }
+.as-action-head { margin-bottom: 4px; }
+.as-action details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+.as-args { display: grid; gap: 4px; margin-top: 6px; font-size: 12.5px; }
+.as-args > div { display: grid; grid-template-columns: 110px 1fr; gap: 8px; }
+.as-args > div > span:first-child { color: var(--muted); font-family: ui-monospace, monospace; }
+.as-args > div > span:last-child { white-space: pre-wrap; word-break: break-word; }
+.as-result { margin-top: 6px; font-weight: 600; }
+.as-result.good { color: var(--good); }
+.as-result.bad { color: var(--bad); }

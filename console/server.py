@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import dotenv_values, set_key
 
-from . import auth, browser, notify, providers, rules, safety, shop, store
+from . import assistant, auth, browser, notify, providers, rules, safety, shop, store
 
 BASE_DIR = store.BASE_DIR
 ENV_PATH = store.ENV_PATH
@@ -553,6 +553,9 @@ POST_ROUTES = {
     "/api/listings/save": lambda p, u: shop.save_listing(p),
     "/api/listings/delete": lambda p, u: shop.delete_listing(p.get("id")),
     "/api/listings/ai_write": lambda p, u: shop.ai_write(p.get("brief", "")),
+    "/api/assistant/chat": lambda p, u: assistant.chat(p.get("messages")),
+    "/api/assistant/confirm": lambda p, u: assistant.confirm(p.get("id", ""), p.get("extra")),
+    "/api/assistant/cancel": lambda p, u: assistant.cancel(p.get("id", "")),
     "/api/listings/ai_chat": lambda p, u: shop.ai_chat(p.get("messages"), p.get("draft"), bool(p.get("has_images"))),
     "/api/users/password": lambda p, u: auth.change_password(u["id"], p.get("old_password"),
                                                              p.get("new_password"), u.get("token")),
