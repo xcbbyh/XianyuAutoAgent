@@ -7,6 +7,7 @@ AI 模型接入：内置常用平台，所有平台都走 OpenAI 兼容接口。
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import store
 
@@ -250,24 +251,78 @@ def delete_custom(provider_id):
     store.execute("DELETE FROM providers WHERE id = ?", (provider_id,))
 
 
-def test_provider(provider_id):
-    """用第一个 Key 发一句「你好」测试连通性"""
+# 常见错误码的中文说明，测试结果里显示给用户看
+ERROR_HINTS = {
+    400: "请求被拒绝，多半是模型名称填错了",
+    401: "Key 无效或已过期",
+    402: "账户余额不足",
+    403: "没有权限（该模型不在你的套餐/免费档里，或地区受限）",
+    404: "接口地址或模型名称不存在",
+    429: "请求太频繁或额度用完了",
+}
+
+
+def _describe_error(e, provider):
+    """把调用异常整理成「状态码 + 中文原因 + 原始信息」；网络问题和 Key 问题分开说"""
+    code = getattr(e, "status_code", None)
+    name = type(e).__name__
+    kind = "key"
+    if code:
+        hint = ERROR_HINTS.get(code) or ("平台服务器出错，稍后再试" if code >= 500 else "调用失败")
+        if code >= 500:
+            kind = "server"
+    elif "Timeout" in name or "Connection" in name:
+        kind = "network"
+        what = "超时没有响应" if "Timeout" in name else "连不上接口地址"
+        if provider.get("category") == "local":
+            hint = f"网络问题：{what}，请确认本地模型程序已经启动"
+        elif provider.get("category") == "overseas" or provider.get("id") == "openrouter":
+            hint = f"网络问题：{what}。海外模型需要代理，请确认代理软件（如 Clash）让 python.exe 走代理，而不是直连"
+        else:
+            hint = f"网络问题：{what}，请检查网络或接口地址"
+    else:
+        hint = "调用失败"
+    return {"code": code, "kind": kind, "hint": hint, "error": str(e)[:300]}
+
+
+def _test_key(provider, index, key):
     from .llm import call_provider
 
-    provider = get_provider(provider_id)
-    if not provider["api_keys"]:
-        raise ValueError("请先配置 API Key")
     start = time.time()
+    item = {"index": index + 1, "key": _mask(key), "length": len(key)}
     try:
         resp = call_provider(
-            provider, provider["api_keys"][0],
+            provider, key,
             messages=[{"role": "user", "content": "你好，请用一句话介绍你自己"}],
-            max_tokens=60, temperature=0.3,
+            max_tokens=60, temperature=0.3, timeout=25,
         )
-        result = {"ok": True, "latency": round(time.time() - start, 2),
-                  "reply": (resp.choices[0].message.content or "").strip()[:120]}
+        item.update(ok=True, reply=(resp.choices[0].message.content or "").strip()[:120])
     except Exception as e:
-        result = {"ok": False, "latency": round(time.time() - start, 2), "error": str(e)[:300]}
-    result["time"] = time.time()
+        item.update(ok=False, **_describe_error(e, provider))
+    item["ms"] = int((time.time() - start) * 1000)
+    return item
+
+
+def test_provider(provider_id):
+    """每个 Key 都真实发一句「你好」，同时测试，返回每个 Key 的状态和耗时"""
+    provider = get_provider(provider_id)
+    keys = provider["api_keys"]
+    if not keys:
+        raise ValueError("请先配置 API Key")
+    with ThreadPoolExecutor(max_workers=min(len(keys), 8)) as pool:
+        items = list(pool.map(lambda pair: _test_key(provider, *pair), enumerate(keys)))
+    ok_items = [i for i in items if i["ok"]]
+    first_bad = next((i for i in items if not i["ok"]), None)
+    result = {
+        "ok": bool(ok_items),
+        "ok_count": len(ok_items),
+        "total": len(items),
+        "model": provider["model"],
+        "latency": round(min(i["ms"] for i in ok_items) / 1000, 2) if ok_items else None,
+        "reply": ok_items[0]["reply"] if ok_items else "",
+        "error": "" if ok_items else f"{first_bad['code'] or ''} {first_bad['hint']}".strip(),
+        "keys": items,
+        "time": time.time(),
+    }
     _update(provider_id, {"last_test": json.dumps(result, ensure_ascii=False)})
     return result

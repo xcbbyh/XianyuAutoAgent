@@ -54,3 +54,5 @@ htmlcov/
 .coverage.* 
 # 控制台依赖安装标记
 .deps_installed
+# 控制台数据：数据库、上架图片、网页截图、浏览器登录状态（含登录 Cookie）
+data/

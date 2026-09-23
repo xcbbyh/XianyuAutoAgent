@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import dotenv_values, set_key
 
-from . import auth, notify, providers, rules, safety, shop, store
+from . import auth, browser, notify, providers, rules, safety, shop, store
 
 BASE_DIR = store.BASE_DIR
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -405,7 +405,8 @@ def _overview():
 
 TIME_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 # 程序内部维护的状态，不允许通过接口修改
-INTERNAL_SETTINGS = {"safety_pause_until", "safety_pause_reason", "polish_last_date"}
+INTERNAL_SETTINGS = {"safety_pause_until", "safety_pause_reason", "polish_last_date",
+                     "screenshot_login_url", "screenshot_pages"}
 
 
 def _as_bool(value):
@@ -494,6 +495,8 @@ GET_ROUTES = {
     "/api/items": lambda q, u: list_items(),
     "/api/users": lambda q, u: _require_admin(u) or auth.list_users(),
     "/api/safety": lambda q, u: safety.status(),
+    "/api/screenshots": lambda q, u: {**browser.get_config(), **browser.list_shots(), "browser": browser.status()},
+    "/api/screenshots/status": lambda q, u: browser.status(),
     "/api/shop": lambda q, u: {"items": shop.list_my_items(), "task": shop.task_state(),
                                "next_polish": shop.scheduler.next_polish_time(),
                                "settings": store.get_settings()["auto_polish"], "safety": safety.status()},
@@ -535,9 +538,20 @@ POST_ROUTES = {
     "/api/shop/polish": lambda p, u: shop.polish_one(p.get("item_id", "")),
     "/api/shop/settings": lambda p, u: _save_settings({"auto_polish": p}, u),
     "/api/listings/upload": lambda p, u: shop.save_image(p.get("name", ""), p.get("data", "")),
+    "/api/listings/from_screenshot": lambda p, u: shop.import_image_file(
+        browser.shot_path(p.get("date", ""), p.get("file", ""))),
+    "/api/screenshots/config": lambda p, u: browser.save_config(p),
+    "/api/screenshots/open": lambda p, u: browser.open_page(p.get("url", "")),
+    "/api/screenshots/close": lambda p, u: browser.close_browser(),
+    "/api/screenshots/capture": lambda p, u: browser.start_capture(p.get("names")),
+    "/api/screenshots/delete": lambda p, u: browser.delete_shot(p.get("date", ""), p.get("file", "")),
+    "/api/screenshots/folder": lambda p, u: browser.open_folder(),
+    "/api/screenshots/xianyu_login": lambda p, u: browser.open_page(browser.XIANYU_URL),
+    "/api/screenshots/xianyu_cookie": lambda p, u: bot.submit_cookie(browser.read_xianyu_cookie()) or account_info(),
     "/api/listings/save": lambda p, u: shop.save_listing(p),
     "/api/listings/delete": lambda p, u: shop.delete_listing(p.get("id")),
     "/api/listings/ai_write": lambda p, u: shop.ai_write(p.get("brief", "")),
+    "/api/listings/ai_chat": lambda p, u: shop.ai_chat(p.get("messages"), p.get("draft"), bool(p.get("has_images"))),
     "/api/users/password": lambda p, u: auth.change_password(u["id"], p.get("old_password"),
                                                              p.get("new_password"), u.get("token")),
 }
@@ -586,6 +600,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with open(shop.image_path(url.path.rsplit("/", 1)[-1]), "rb") as f:
                     return self._send(200, f.read(), "image/jpeg")
+            except (ValueError, OSError):
+                return self._send(404, {"error": "not found"})
+        if url.path.startswith("/screenshots/"):
+            if not auth.user_by_token(self._token()):
+                return self._send(401, {"error": "请先登录"})
+            try:
+                _, _, day, filename = unquote(url.path).split("/", 3)
+                with open(browser.shot_path(day, filename), "rb") as f:
+                    return self._send(200, f.read(), "image/png")
             except (ValueError, OSError):
                 return self._send(404, {"error": "not found"})
         if url.path == "/api/auth/state":
