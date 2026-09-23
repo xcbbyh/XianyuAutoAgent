@@ -257,8 +257,22 @@ ERROR_HINTS = {
     402: "账户余额不足",
     403: "没有权限（该模型不在你的套餐/免费档里，或地区受限）",
     404: "接口地址或模型名称不存在",
-    429: "请求太频繁或额度用完了",
+    422: "请求参数不被平台接受",
+    429: "请求太频繁或额度用完了（免费档有每秒次数限制）",
 }
+
+
+def _platform_message(e):
+    """取出平台返回的原始错误说明，例如 Mistral 的 {"message": "..."}"""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        msg = err.get("message") or err.get("detail") or ""
+        if isinstance(msg, (list, dict)):
+            msg = json.dumps(msg, ensure_ascii=False)
+        if msg:
+            return str(msg)[:160]
+    return str(e)[:160]
 
 
 def _describe_error(e, provider):
@@ -281,7 +295,16 @@ def _describe_error(e, provider):
             hint = f"网络问题：{what}，请检查网络或接口地址"
     else:
         hint = "调用失败"
-    return {"code": code, "kind": kind, "hint": hint, "error": str(e)[:300]}
+    return {"code": code, "kind": kind, "hint": hint, "error": str(e)[:300], "detail": _platform_message(e)}
+
+
+def explain_error(e, provider):
+    """一句话说明失败原因，给 AI 助手等页面直接显示"""
+    d = _describe_error(e, provider)
+    text = f"{d['code']} {d['hint']}" if d["code"] else d["hint"]
+    if d["kind"] != "network" and d["detail"] and d["detail"] not in text:
+        text += f"（平台说：{d['detail']}）"
+    return text
 
 
 def _test_key(provider, index, key):

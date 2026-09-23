@@ -288,7 +288,7 @@ def _system_prompt():
 
 def _call_llm(messages):
     resp = shop._llm().chat.completions.create(
-        model="", temperature=0.3, max_tokens=1500,
+        model="", temperature=0.3, max_tokens=1500, timeout=90,
         messages=[{"role": "system", "content": _system_prompt()}, *messages],
     )
     text = (resp.choices[0].message.content or "").strip()
@@ -328,6 +328,8 @@ def chat(messages):
 
     new_messages, actions = [], []
     for round_no in range(MAX_ROUNDS):
+        if round_no:
+            time.sleep(1.2)  # 免费档模型常有「每秒 1 次」的限制，连续查资料时稍微隔开
         try:
             result, raw = _call_llm(history + [{k: m[k] for k in ("role", "content")} for m in new_messages])
         except RuntimeError as e:

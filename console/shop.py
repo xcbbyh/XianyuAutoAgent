@@ -590,7 +590,7 @@ def ai_chat(messages, draft=None, has_images=False):
                f"卖家{'已经' if has_images else '还没有'}添加商品图片。")
     try:
         resp = _llm().chat.completions.create(
-            model="", temperature=0.5, max_tokens=1200,
+            model="", temperature=0.5, max_tokens=1200, timeout=90,
             messages=[{"role": "system", "content": CHAT_SYSTEM + "\n\n" + context}, *history],
         )
     except RuntimeError as e:

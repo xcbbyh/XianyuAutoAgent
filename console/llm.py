@@ -6,6 +6,7 @@
 Key 轮换使用，失败自动换下一个 Key / 下一个平台。
 """
 import threading
+import time
 from types import SimpleNamespace
 
 from loguru import logger
@@ -49,6 +50,45 @@ def call_provider(provider, api_key, **kwargs):
     return client.chat.completions.create(**params)
 
 
+# 限流（429）和平台临时出错（5xx）时同一个 Key 等一会再试，最多再试 2 次
+# 免费档常见「每秒 1 次」的限制：AI 助手查资料时会连着调用几次，不等一下就会被拒
+RETRY_WAITS = (2, 5)
+
+
+def _retry_wait(e, attempt):
+    """这次失败值得同一个 Key 再试就返回要等的秒数，否则返回 None"""
+    code = getattr(e, "status_code", None)
+    name = type(e).__name__
+    if code == 429 or (code and code >= 500):
+        if attempt >= len(RETRY_WAITS):
+            return None
+        wait = RETRY_WAITS[attempt]
+        try:
+            header = e.response.headers.get("retry-after")
+            if header:
+                wait = min(max(float(header), wait), 15)
+        except Exception:
+            pass
+        return wait
+    if ("Timeout" in name or "Connection" in name) and attempt == 0:
+        return 1
+    return None
+
+
+def call_with_retry(provider, api_key, **kwargs):
+    attempt = 0
+    while True:
+        try:
+            return call_provider(provider, api_key, **kwargs)
+        except Exception as e:
+            wait = _retry_wait(e, attempt)
+            if wait is None:
+                raise
+            logger.info(f"{provider['name']} 暂时不可用（{str(e)[:80]}），{wait} 秒后重试")
+            time.sleep(wait)
+            attempt += 1
+
+
 class RoutedClient:
     def __init__(self, fallback_client=None):
         self.fallback_client = fallback_client
@@ -76,11 +116,11 @@ class RoutedClient:
             for offset in range(len(keys)):
                 index = (start + offset) % len(keys)
                 try:
-                    resp = call_provider(provider, keys[index], **kwargs)
+                    resp = call_with_retry(provider, keys[index], **kwargs)
                     if errors:
                         logger.info(f"已切换到 {provider['name']} 第 {index + 1} 个 Key 调用成功")
                     return resp
                 except Exception as e:
-                    logger.warning(f"{provider['name']} 第 {index + 1} 个 Key 调用失败：{str(e)[:200]}")
-                    errors.append(f"{provider['name']}#{index + 1}")
-        raise RuntimeError("所有 AI 模型都调用失败：" + "、".join(errors))
+                    logger.warning(f"{provider['name']} 第 {index + 1} 个 Key 调用失败：{str(e)[:300]}")
+                    errors.append(f"{provider['name']} 第 {index + 1} 个 Key：{providers.explain_error(e, provider)}")
+        raise RuntimeError("所有 AI 模型都调用失败。" + "；".join(errors))
