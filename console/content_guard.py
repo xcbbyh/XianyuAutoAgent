@@ -2,7 +2,7 @@
 按闲鱼规则做的发送前安全检查（依据：禁言事件后整理的「闲鱼规则与机器人安全操作」）
 
 - skip_reason()：哪些聊天机器人根本不起草回复，交给卖家本人（活体动物等敏感商品、问「你是AI吗」、看不懂的「啥」「？」）
-- check_reply()：回复发出前检查敏感词、同一聊天的发送频率、和之前发过的话是否几乎一样；有问题就不让发
+- check_reply()：回复发出前检查敏感词、AI 腔（真人模式）、同一聊天的发送频率、和之前发过的话是否几乎一样；有问题就不让发
 """
 import difflib
 import re
@@ -33,6 +33,26 @@ BANNED = [
     ("自称官方/客服", ["客服", "店铺"]),
 ]
 
+# 真人模式：拼到回复类提示词的最后（优先级最高）
+HUMAN_STYLE_PROMPT = """
+
+【真人模式（必须遵守，优先级最高）】
+1. 你就是卖家本人在手机上打字，像跟朋友聊天一样自然随意，一两句话说完，不超过30字
+2. 不列卖点，不用「/」或一串顿号堆词，不分点，不换行
+3. 不用表情符号，不用感叹号，不用「亲亲」「哦~」「呢~」「为您服务」这类客服腔
+4. 不推销、不催单，对方问什么只答什么
+5. 绝对不说自己是 AI、机器人、助手或客服，也不要暗示；对方问你是不是 AI，只输出 -
+6. 每次换自己的话说，不重复前面说过的句子
+7. 商品信息里没写的不编，不确定就说「我看下再回你」
+"""
+
+# 一看就是 AI / 客服写的话
+AI_SELF = re.compile(r"AI|ai助手|人工智能|机器人|语言模型|大模型|作为.{0,6}(助手|客服)|我是.{0,4}(助手|客服)|智能回复|自动回复")
+SALES_TONE = ["亲亲", "亲~", "哦~", "呢~", "哈~", "欢迎咨询", "竭诚", "为您服务", "感谢您的", "有任何问题", "随时联系",
+              "随时咨询", "放心购买", "放心拍", "想要就下单", "赶紧", "手慢无", "抓紧", "欢迎下单", "欢迎选购", "性价比超高"]
+EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F]")
+MAX_HUMAN_LEN = 60
+
 MIN_GAP_SECONDS = 120   # 同一个聊天两条自动回复之间至少隔 2 分钟
 MAX_PER_HOUR = 3        # 同一个聊天每小时最多 3 条
 MAX_PER_DAY = 10        # 同一个聊天每天最多 10 条
@@ -62,6 +82,34 @@ def banned_words(text, item_title=""):
     return hits
 
 
+def humanize(text):
+    """AI 草稿的简单清理：去掉表情符号，换行改成逗号"""
+    text = EMOJI.sub("", text or "")
+    text = re.sub(r"\s*\n+\s*", "，", text.strip())
+    return text.strip("，").strip()
+
+
+def ai_tone(text, item_title=""):
+    """不像真人说话的地方"""
+    text = text or ""
+    found = []
+    m = AI_SELF.search(text)
+    if m and m.group(0) not in (item_title or ""):
+        found.append(f"提到了「{m.group(0)}」，会暴露是 AI")
+    tone = [w for w in SALES_TONE if w in text]
+    if tone:
+        found.append("客服腔/推销腔：" + "、".join(tone))
+    if EMOJI.search(text):
+        found.append("有表情符号")
+    if "\n" in text or text.count("/") >= 2 or text.count("、") >= 3 or re.search(r"(^|\s)[1-9][.、]", text):
+        found.append("像在列卖点清单")
+    if text.count("！") + text.count("!") >= 2:
+        found.append("感叹号太多")
+    if len(text) > MAX_HUMAN_LEN:
+        found.append(f"太长了（{len(text)} 字），真人一般一两句话")
+    return found
+
+
 def recent_sent(chat_id, seconds):
     return store.rows(
         "SELECT detail, created_at FROM events WHERE chat_id = ? AND created_at > ? AND type IN (?, ?, ?) "
@@ -79,6 +127,9 @@ def check_reply(chat_id, text, item_title="", kind="ai"):
     words = banned_words(text, item_title)
     if words:
         problems.append("包含闲鱼敏感词：" + "、".join(words) + "，请改掉再发")
+    tone = ai_tone(text, item_title)
+    if tone:
+        problems.append("不像真人说话：" + "；".join(tone) + "，请改一改")
     day = recent_sent(chat_id, 86400)
     if day:
         gap = time.time() - day[0]["created_at"]

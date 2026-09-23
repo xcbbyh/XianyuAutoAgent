@@ -209,6 +209,9 @@ class XianyuLive:
             logger.info(f"🔴 会话 {chat_id} 在生成回复期间被人工接管，不发送 AI 回复")
             return
 
+        bot_reply = content_guard.humanize(bot_reply)
+        if not bot_reply:
+            return
         logger.info(f"机器人回复: {bot_reply}")
         await self.send_or_queue(reply_kind, chat_id, item_id, buyer_id, buyer_name, text, bot_reply)
 
