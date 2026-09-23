@@ -110,8 +110,7 @@ def _migrate_env_key():
         return
     from dotenv import dotenv_values
 
-    env = dotenv_values(os.path.join(store.BASE_DIR, ".env")) if os.path.exists(
-        os.path.join(store.BASE_DIR, ".env")) else {}
+    env = dotenv_values(store.ENV_PATH) if os.path.exists(store.ENV_PATH) else {}
     key = (env.get("API_KEY") or "").strip()
     if not key or "apikey" in key.lower() or "百炼" in key:
         return

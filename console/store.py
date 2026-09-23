@@ -13,6 +13,8 @@ from contextlib import contextmanager
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
+# Docker 里设置 ENV_FILE=/app/data/.env，让 Cookie 等配置跟 data 目录一起保留
+ENV_PATH = os.getenv("ENV_FILE") or os.path.join(BASE_DIR, ".env")
 DB_PATH = os.path.join(DATA_DIR, "console.db")
 CHAT_DB_PATH = os.path.join(DATA_DIR, "chat_history.db")
 
